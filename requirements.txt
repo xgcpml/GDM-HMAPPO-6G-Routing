@@ -1,0 +1,4 @@
+networkx>=3.6
+numpy>=2.4
+torch>=2.11
+tqdm>=4.67
