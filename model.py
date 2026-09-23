@@ -39,6 +39,69 @@ class GraphEncoder(nn.Module):
         return x
 
 
+class GraphAttentionLayer(nn.Module):
+    def __init__(self, hidden_dim: int, attention_heads: int):
+        super().__init__()
+        if hidden_dim % attention_heads != 0:
+            raise ValueError("hidden_dim must be divisible by attention_heads")
+        self.attention_heads = attention_heads
+        self.head_dim = hidden_dim // attention_heads
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.output = nn.Linear(hidden_dim, hidden_dim)
+        self.attention_norm = nn.LayerNorm(hidden_dim)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+        self.feed_forward_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: Tensor, adjacency: Tensor) -> Tensor:
+        batch_size, num_nodes, hidden_dim = x.shape
+        shape = (batch_size, num_nodes, self.attention_heads, self.head_dim)
+        query = self.query(x).view(shape).transpose(1, 2)
+        key = self.key(x).view(shape).transpose(1, 2)
+        value = self.value(x).view(shape).transpose(1, 2)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) / self.head_dim**0.5
+        identity = torch.eye(num_nodes, device=x.device, dtype=torch.bool).unsqueeze(0)
+        edge_mask = (adjacency > 0) | identity
+        edge_bias = torch.log1p(adjacency.clamp_min(0.0)).unsqueeze(1)
+        scores = (scores + edge_bias).masked_fill(
+            ~edge_mask.unsqueeze(1), torch.finfo(scores.dtype).min
+        )
+        weights = F.softmax(scores, dim=-1)
+        attended = torch.matmul(weights, value).transpose(1, 2).reshape(
+            batch_size, num_nodes, hidden_dim
+        )
+        x = self.attention_norm(x + self.output(attended))
+        return self.feed_forward_norm(x + self.feed_forward(x))
+
+
+class GraphAttentionEncoder(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        attention_heads: int,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.layers = nn.ModuleList(
+            GraphAttentionLayer(hidden_dim, attention_heads)
+            for _ in range(num_layers)
+        )
+
+    def forward(self, node_features: Tensor, adjacency: Tensor) -> Tensor:
+        x = F.relu(self.input_proj(node_features))
+        for layer in self.layers:
+            x = layer(x, adjacency)
+        return x
+
+
 class NodeFeatureEncoder(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int):
         super().__init__()
@@ -60,9 +123,19 @@ class TransformerContextBlock(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim),
         )
         self.feed_forward_norm = nn.LayerNorm(hidden_dim)
+        self.capture_attention = False
+        self.last_attention_weights: Tensor | None = None
 
     def forward(self, x: Tensor) -> Tensor:
-        attended, _ = self.attention(x, x, x, need_weights=False)
+        attended, weights = self.attention(
+            x,
+            x,
+            x,
+            need_weights=self.capture_attention,
+            average_attn_weights=False,
+        )
+        if self.capture_attention and weights is not None:
+            self.last_attention_weights = weights.detach().cpu()
         x = self.attention_norm(x + attended)
         feed_forward = self.feed_forward(x)
         return self.feed_forward_norm(x + feed_forward)
@@ -273,8 +346,18 @@ class ConditionalDiffusionAllocator(nn.Module):
                 latent - (beta_t / torch.sqrt(1.0 - alpha_bar_t).clamp_min(1e-6)) * pred_noise
             ) / torch.sqrt(alpha_t).clamp_min(1e-6)
 
-            if step > 0 and stochastic:
-                latent = latent + torch.randn_like(latent) * torch.sqrt(beta_t) * 0.35
+            if step > 0 and stochastic and self.sample_noise_scale > 0.0:
+                anneal_ratio = min(
+                    self.sample_noise_scale / max(self.noise_scale, 1e-6),
+                    1.0,
+                )
+                latent = (
+                    latent
+                    + torch.randn_like(latent)
+                    * torch.sqrt(beta_t)
+                    * 0.35
+                    * anneal_ratio
+                )
             latent = latent.clamp(-self.latent_clip, self.latent_clip)
             denoised_norms.append(latent.norm(dim=-1))
 
@@ -430,6 +513,98 @@ class DirectAllocationHead(nn.Module):
         self.sample_noise_scale = max(float(noise_scale), 0.0)
 
 
+class GaussianAllocationHead(nn.Module):
+    """Diagonal Gaussian latent policy followed by a logistic-normal map."""
+
+    def __init__(self, condition_dim: int, hidden_dim: int, alloc_dim: int, noise_scale: float):
+        super().__init__()
+        self.alloc_dim = alloc_dim
+        self.sample_noise_scale = noise_scale
+        self.stats_head = nn.Sequential(
+            nn.Linear(condition_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, alloc_dim * 2),
+        )
+
+    def _stats(self, condition: Tensor) -> tuple[Tensor, Tensor]:
+        mean, log_std = torch.chunk(self.stats_head(condition), 2, dim=-1)
+        return mean, log_std.clamp(-4.5, 1.0)
+
+    def sample(self, condition: Tensor, deterministic: bool) -> tuple[Tensor, Dict[str, Tensor]]:
+        mean, log_std = self._stats(condition)
+        latent = mean
+        if not deterministic and self.sample_noise_scale > 0.0:
+            latent = mean + torch.randn_like(mean) * log_std.exp() * self.sample_noise_scale
+        allocation = F.softmax(latent, dim=-1)
+        zeros = torch.zeros(condition.size(0), device=condition.device, dtype=condition.dtype)
+        return allocation, {
+            "alloc_refinement_norm": zeros,
+            "pred_noise_norm": log_std.exp().norm(dim=-1),
+        }
+
+    def sample_candidates(self, condition: Tensor, num_candidates: int) -> tuple[Tensor, Dict[str, Tensor]]:
+        mean, log_std = self._stats(condition)
+        count = max(int(num_candidates), 1)
+        if count == 1:
+            latent = mean.unsqueeze(1)
+        else:
+            offsets = torch.linspace(-1.0, 1.0, count, device=mean.device, dtype=mean.dtype)
+            latent = mean.unsqueeze(1) + offsets.view(1, count, 1) * log_std.exp().unsqueeze(1)
+        allocations = F.softmax(latent, dim=-1)
+        zeros = torch.zeros(condition.size(0), count, device=condition.device, dtype=condition.dtype)
+        return allocations, {
+            "alloc_refinement_norm": zeros,
+            "pred_noise_norm": log_std.exp().norm(dim=-1, keepdim=True).expand(-1, count),
+        }
+
+    def training_loss(
+        self,
+        condition: Tensor,
+        target_allocation: Tensor,
+        advantage: Tensor,
+        eta: float,
+        wmin: float,
+        wmax: float,
+        recon_coef: float,
+        prior_coef: float,
+        sample_weight: Tensor | None = None,
+    ) -> Dict[str, Tensor]:
+        del prior_coef
+        mean, log_std = self._stats(condition)
+        target_latent = torch.log(target_allocation.clamp_min(1e-6))
+        target_latent = target_latent - target_latent.mean(dim=-1, keepdim=True)
+        variance = torch.exp(2.0 * log_std).clamp_min(1e-6)
+        per_sample_nll = 0.5 * (
+            (target_latent - mean).square() / variance
+            + 2.0 * log_std
+            + torch.log(mean.new_tensor(2.0 * torch.pi))
+        ).mean(dim=-1)
+        reconstruction = F.softmax(mean, dim=-1)
+        per_sample_recon = (reconstruction - target_allocation).square().mean(dim=-1)
+        weights = torch.clamp(torch.exp(eta * advantage.detach()), min=wmin, max=wmax)
+        if sample_weight is not None:
+            weights = weights * sample_weight.detach().clamp_min(0.0)
+        combined = per_sample_nll + recon_coef * per_sample_recon
+        loss = (weights * combined).sum() / weights.sum().clamp_min(1e-6)
+        zero = loss.new_zeros(())
+        return {
+            "diffusion_loss": loss,
+            "noise_loss": per_sample_nll.mean(),
+            "recon_loss": per_sample_recon.mean(),
+            "prior_loss": zero,
+            "adv_weight": weights.mean(),
+            "pred_noise_norm": log_std.exp().norm(dim=-1).mean(),
+            "denoised_allocation_shift": (
+                reconstruction - target_allocation
+            ).norm(dim=-1).mean(),
+        }
+
+    def set_sample_noise_scale(self, noise_scale: float) -> None:
+        self.sample_noise_scale = max(float(noise_scale), 0.0)
+
+
 class HybridRoutingPolicy(nn.Module):
     def __init__(
         self,
@@ -452,9 +627,14 @@ class HybridRoutingPolicy(nn.Module):
         surrogate_penalty_coef: float,
         use_topology_route_prior: bool,
         use_search_guided_inference: bool,
+        use_heuristic_search_candidates: bool = True,
         use_gnn_encoder: bool = True,
+        use_graph_attention_encoder: bool = False,
         use_transformer_context: bool = True,
+        use_global_graph_context: bool = True,
+        use_candidate_resource_summaries: bool = True,
         use_gdm_allocator: bool = True,
+        allocation_policy_family: str = "gdm",
     ):
         super().__init__()
         self.alloc_dim = alloc_dim
@@ -464,15 +644,33 @@ class HybridRoutingPolicy(nn.Module):
         self.surrogate_penalty_coef = surrogate_penalty_coef
         self.use_topology_route_prior = bool(use_topology_route_prior)
         self.use_search_guided_inference = bool(use_search_guided_inference)
+        self.use_heuristic_search_candidates = bool(use_heuristic_search_candidates)
         self.use_gnn_encoder = bool(use_gnn_encoder)
+        self.use_graph_attention_encoder = bool(use_graph_attention_encoder)
         self.use_transformer_context = bool(use_transformer_context)
-        self.use_gdm_allocator = bool(use_gdm_allocator)
+        self.use_global_graph_context = bool(use_global_graph_context)
+        self.use_candidate_resource_summaries = bool(use_candidate_resource_summaries)
+        family = allocation_policy_family.strip().lower()
+        if not use_gdm_allocator and family == "gdm":
+            family = "direct"
+        if family not in {"gdm", "direct", "gaussian"}:
+            raise ValueError(f"Unsupported allocation policy family: {family}")
+        self.allocation_policy_family = family
+        self.use_gdm_allocator = family == "gdm"
         self.current_topology_prior_scale = 1.0
-        self.graph_encoder = (
-            GraphEncoder(node_feature_dim, hidden_dim, num_graph_layers)
-            if self.use_gnn_encoder
-            else NodeFeatureEncoder(node_feature_dim, hidden_dim)
-        )
+        if not self.use_gnn_encoder:
+            self.graph_encoder = NodeFeatureEncoder(node_feature_dim, hidden_dim)
+        elif self.use_graph_attention_encoder:
+            self.graph_encoder = GraphAttentionEncoder(
+                node_feature_dim,
+                hidden_dim,
+                num_graph_layers,
+                attention_heads,
+            )
+        else:
+            self.graph_encoder = GraphEncoder(
+                node_feature_dim, hidden_dim, num_graph_layers
+            )
         self.transformer_blocks = nn.ModuleList(
             TransformerContextBlock(hidden_dim, attention_heads)
             for _ in range(max(int(num_transformer_layers), 0) if self.use_transformer_context else 0)
@@ -486,22 +684,22 @@ class HybridRoutingPolicy(nn.Module):
         )
         self.register_buffer("topology_confidence_weight", torch.tensor(0.16, dtype=torch.float32))
 
-        candidate_input_dim = hidden_dim * 2 + candidate_feature_dim + task_feature_dim
+        candidate_input_dim = hidden_dim * 3 + candidate_feature_dim + task_feature_dim
         self.route_head = nn.Sequential(
             nn.Linear(candidate_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-        value_input_dim = hidden_dim + task_feature_dim
+        value_input_dim = hidden_dim * 2 + task_feature_dim
         self.value_head = nn.Sequential(
             nn.Linear(value_input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-        self.allocation_head = (
-            ConditionalDiffusionAllocator(
+        if family == "gdm":
+            self.allocation_head = ConditionalDiffusionAllocator(
                 condition_dim=candidate_input_dim,
                 hidden_dim=hidden_dim,
                 alloc_dim=alloc_dim,
@@ -511,14 +709,20 @@ class HybridRoutingPolicy(nn.Module):
                 noise_scale=alloc_noise_scale,
                 latent_clip=diffusion_latent_clip,
             )
-            if self.use_gdm_allocator
-            else DirectAllocationHead(
+        elif family == "gaussian":
+            self.allocation_head = GaussianAllocationHead(
                 condition_dim=candidate_input_dim,
                 hidden_dim=hidden_dim,
                 alloc_dim=alloc_dim,
                 noise_scale=alloc_noise_scale,
             )
-        )
+        else:
+            self.allocation_head = DirectAllocationHead(
+                condition_dim=candidate_input_dim,
+                hidden_dim=hidden_dim,
+                alloc_dim=alloc_dim,
+                noise_scale=alloc_noise_scale,
+            )
         self.current_allocation_noise_scale = alloc_noise_scale
         self.current_route_sampling_temperature = 1.0
 
@@ -536,6 +740,7 @@ class HybridRoutingPolicy(nn.Module):
             route = route_dist.sample()
         condition = self._select_route_condition(encoded, route)
         allocation, alloc_aux = self.allocation_head.sample(condition, deterministic=deterministic_allocation)
+        allocation = self._mask_allocation(obs, route, allocation)
 
         return {
             "route": route,
@@ -559,6 +764,22 @@ class HybridRoutingPolicy(nn.Module):
             self.current_topology_prior_scale = 0.0
             return
         self.current_topology_prior_scale = max(float(scale), 0.0)
+
+    def capture_attention_matrices(self, obs: Dict[str, Tensor]) -> list[Tensor]:
+        if not self.transformer_blocks:
+            raise ValueError("The policy has no Transformer attention blocks.")
+        for block in self.transformer_blocks:
+            block.capture_attention = True
+            block.last_attention_weights = None
+        try:
+            self._encode(obs)
+        finally:
+            for block in self.transformer_blocks:
+                block.capture_attention = False
+        matrices = [block.last_attention_weights for block in self.transformer_blocks]
+        if any(matrix is None for matrix in matrices):
+            raise RuntimeError("Attention capture did not produce every layer matrix.")
+        return [matrix for matrix in matrices if matrix is not None]
 
     def act_deterministic(self, obs: Dict[str, Tensor]) -> Dict[str, Tensor]:
         if not self.use_search_guided_inference:
@@ -623,6 +844,9 @@ class HybridRoutingPolicy(nn.Module):
             "value": encoded["value"],
             "route_condition": self._select_route_condition(encoded, route),
         }
+
+    def value(self, obs: Dict[str, Tensor]) -> Tensor:
+        return self._encode(obs)["value"]
 
     def diffusion_training_loss(
         self,
@@ -690,12 +914,33 @@ class HybridRoutingPolicy(nn.Module):
             node_embeddings = block(node_embeddings)
 
         global_context = node_embeddings.mean(dim=1)
-        path_embeddings = self._gather_path_embeddings(node_embeddings, obs["candidate_nodes"])
+        if not self.use_global_graph_context:
+            global_context = torch.zeros_like(global_context)
+        batch_indices = torch.arange(node_embeddings.size(0), device=node_embeddings.device)
+        source_embeddings = node_embeddings[batch_indices, obs["source_node"]]
+        path_embeddings = self._gather_path_embeddings(
+            node_embeddings,
+            obs["candidate_nodes"],
+            obs["candidate_node_mask"],
+        )
 
         task_context = obs["task_features"].unsqueeze(1).expand(-1, path_embeddings.size(1), -1)
+        source_context = source_embeddings.unsqueeze(1).expand(
+            -1, path_embeddings.size(1), -1
+        )
         global_context_expanded = global_context.unsqueeze(1).expand(-1, path_embeddings.size(1), -1)
+        candidate_features = obs["candidate_features"]
+        if not self.use_candidate_resource_summaries:
+            candidate_features = candidate_features.clone()
+            candidate_features[..., [4, 5, 6, 7, 9, 12, 13]] = 0.0
         candidate_context = torch.cat(
-            [path_embeddings, global_context_expanded, obs["candidate_features"], task_context],
+            [
+                path_embeddings,
+                global_context_expanded,
+                source_context,
+                candidate_features,
+                task_context,
+            ],
             dim=-1,
         )
         route_head_logits = self.route_head(candidate_context).squeeze(-1)
@@ -707,7 +952,9 @@ class HybridRoutingPolicy(nn.Module):
             route_prior_logits = torch.zeros_like(policy_route_logits)
             route_logits = policy_route_logits
 
-        value = self.value_head(torch.cat([global_context, obs["task_features"]], dim=-1)).squeeze(-1)
+        value = self.value_head(
+            torch.cat([global_context, source_embeddings, obs["task_features"]], dim=-1)
+        ).squeeze(-1)
         return {
             "candidate_context": candidate_context,
             "policy_route_logits": policy_route_logits,
@@ -716,20 +963,47 @@ class HybridRoutingPolicy(nn.Module):
             "value": value,
         }
 
-    def _gather_path_embeddings(self, node_embeddings: Tensor, candidate_nodes: Tensor) -> Tensor:
+    def _gather_path_embeddings(
+        self,
+        node_embeddings: Tensor,
+        candidate_nodes: Tensor,
+        candidate_node_mask: Tensor,
+    ) -> Tensor:
         num_candidates = candidate_nodes.size(1)
         expanded_nodes = candidate_nodes.unsqueeze(-1).expand(-1, -1, -1, node_embeddings.size(-1))
         expanded_embeddings = node_embeddings.unsqueeze(1).expand(-1, num_candidates, -1, -1)
         path_embeddings = torch.gather(expanded_embeddings, dim=2, index=expanded_nodes)
-        return path_embeddings.mean(dim=2)
+        node_mask = candidate_node_mask.unsqueeze(-1)
+        return (path_embeddings * node_mask).sum(dim=2) / node_mask.sum(dim=2).clamp_min(1.0)
+
+    def _mask_allocation(
+        self,
+        obs: Dict[str, Tensor],
+        route: Tensor,
+        allocation: Tensor,
+    ) -> Tensor:
+        batch_indices = torch.arange(route.size(0), device=route.device)
+        mask = obs["candidate_alloc_mask"][batch_indices, route]
+        if allocation.ndim == 3:
+            mask = mask.unsqueeze(1)
+        masked = allocation * mask
+        normalizer = masked.sum(dim=-1, keepdim=True)
+        fallback = mask / mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return torch.where(
+            normalizer > 1e-8,
+            masked / normalizer.clamp_min(1e-8),
+            fallback,
+        )
 
     def _select_route_condition(self, encoded: Dict[str, Tensor], route: Tensor) -> Tensor:
         batch_indices = torch.arange(route.size(0), device=route.device)
         return encoded["candidate_context"][batch_indices, route]
 
     def _apply_route_mask(self, route_logits: Tensor, candidate_mask: Tensor) -> Tensor:
-        confidence_prior = candidate_mask.clamp_min(1e-3)
-        return route_logits + torch.log(confidence_prior)
+        valid_routes = candidate_mask > 0.5
+        if not bool(torch.all(valid_routes.any(dim=-1))):
+            raise ValueError("Every task must expose at least one available candidate route.")
+        return route_logits.masked_fill(~valid_routes, torch.finfo(route_logits.dtype).min)
 
     def _estimate_allocation_scores(
         self,
@@ -740,7 +1014,12 @@ class HybridRoutingPolicy(nn.Module):
         batch_indices = torch.arange(route.size(0), device=route.device)
         selected_features = obs["candidate_features"][batch_indices, route]
         selected_path_nodes = obs["candidate_nodes"][batch_indices, route]
-        selected_nodes = selected_path_nodes[:, -self.alloc_dim :]
+        selected_nodes = obs["candidate_compute_nodes"][batch_indices, route]
+        candidate_allocations = self._mask_allocation(
+            obs,
+            route,
+            candidate_allocations,
+        )
 
         node_feature_dim = obs["node_features"].size(-1)
         gather_index = selected_nodes.unsqueeze(-1).expand(-1, -1, node_feature_dim)
@@ -753,6 +1032,7 @@ class HybridRoutingPolicy(nn.Module):
 
         src_nodes = selected_path_nodes[:, :-1]
         dst_nodes = selected_path_nodes[:, 1:]
+        selected_link_mask = obs["candidate_link_mask"][batch_indices, route]
         edge_batch_indices = batch_indices.unsqueeze(-1).expand_as(src_nodes)
         observed_link_rates = obs["adjacency"][edge_batch_indices, src_nodes, dst_nodes].clamp_min(1e-3)
         data_load = obs["task_features"][:, 1].unsqueeze(-1)
@@ -760,7 +1040,9 @@ class HybridRoutingPolicy(nn.Module):
         propagation_delay = selected_features[:, 8].unsqueeze(-1)
         path_pressure = selected_features[:, 9].unsqueeze(-1)
         wireless_risk = (1.0 - selected_features[:, 1]).unsqueeze(-1)
-        comm_latency = 0.18 * (data_load / observed_link_rates).sum(dim=-1, keepdim=True)
+        comm_latency = 0.18 * (
+            (data_load / observed_link_rates) * selected_link_mask
+        ).sum(dim=-1, keepdim=True)
         comm_latency = comm_latency + 0.55 * propagation_delay + 0.22 * wireless_risk
         comm_latency = comm_latency + 0.18 * (1.0 - path_confidence)
         deadline = obs["task_features"][:, 3].unsqueeze(-1).clamp_min(1e-4)
@@ -778,8 +1060,8 @@ class HybridRoutingPolicy(nn.Module):
         route: Tensor,
     ) -> Tensor:
         batch_indices = torch.arange(route.size(0), device=route.device)
-        selected_path_nodes = obs["candidate_nodes"][batch_indices, route]
-        selected_nodes = selected_path_nodes[:, -self.alloc_dim :]
+        selected_nodes = obs["candidate_compute_nodes"][batch_indices, route]
+        allocation_mask = obs["candidate_alloc_mask"][batch_indices, route]
 
         node_feature_dim = obs["node_features"].size(-1)
         gather_index = selected_nodes.unsqueeze(-1).expand(-1, -1, node_feature_dim)
@@ -790,10 +1072,20 @@ class HybridRoutingPolicy(nn.Module):
         node_pressure = selected_node_features[:, :, 11].clamp_min(0.0)
 
         path_bias = capacity.new_tensor([0.95, 0.95, 1.10]).unsqueeze(0)
-        service_weights = path_bias * capacity / (1.0 + 0.90 * queue_pressure + 0.55 * node_pressure)
+        service_weights = (
+            path_bias
+            * capacity
+            / (1.0 + 0.90 * queue_pressure + 0.55 * node_pressure)
+            * allocation_mask
+        )
 
         queue_averse_bias = capacity.new_tensor([1.00, 1.00, 0.92]).unsqueeze(0)
-        queue_averse_weights = queue_averse_bias * capacity / (1.0 + 1.20 * queue_pressure + 0.70 * node_pressure)
+        queue_averse_weights = (
+            queue_averse_bias
+            * capacity
+            / (1.0 + 1.20 * queue_pressure + 0.70 * node_pressure)
+            * allocation_mask
+        )
 
         service_weights = service_weights / service_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         queue_averse_weights = queue_averse_weights / queue_averse_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -811,8 +1103,17 @@ class HybridRoutingPolicy(nn.Module):
         if candidate_routes is None:
             route_candidates = min(self.route_search_candidates, num_routes)
             top_routes = torch.topk(encoded["route_logits"], k=route_candidates, dim=-1).indices
-            heuristic_routes = encoded["route_prior_logits"].argmax(dim=-1, keepdim=True)
-            candidate_routes = torch.cat([top_routes, heuristic_routes], dim=-1)
+            candidate_routes = top_routes
+            if self.use_heuristic_search_candidates:
+                masked_prior_logits = self._apply_route_mask(
+                    encoded["route_prior_logits"],
+                    obs["candidate_mask"],
+                )
+                heuristic_routes = masked_prior_logits.argmax(dim=-1, keepdim=True)
+                candidate_routes = torch.cat([candidate_routes, heuristic_routes], dim=-1)
+        candidate_route_valid = (
+            obs["candidate_mask"].gather(1, candidate_routes) > 0.5
+        )
         candidate_route_logits = encoded["route_logits"].gather(1, candidate_routes)
         route_candidates = candidate_routes.size(1)
 
@@ -827,21 +1128,31 @@ class HybridRoutingPolicy(nn.Module):
             condition,
             num_candidates=self.allocation_search_candidates,
         )
-        heuristic_allocations = self._heuristic_allocation_candidates(expanded_obs, flat_top_routes)
-        zero_search_stat = torch.zeros(
-            heuristic_allocations.size(0),
-            heuristic_allocations.size(1),
-            device=heuristic_allocations.device,
-            dtype=heuristic_allocations.dtype,
-        )
-        candidate_allocations = torch.cat([heuristic_allocations, candidate_allocations], dim=1)
-        candidate_aux["alloc_refinement_norm"] = torch.cat(
-            [zero_search_stat, candidate_aux["alloc_refinement_norm"]],
-            dim=1,
-        )
-        candidate_aux["pred_noise_norm"] = torch.cat(
-            [zero_search_stat, candidate_aux["pred_noise_norm"]],
-            dim=1,
+        if self.use_heuristic_search_candidates:
+            heuristic_allocations = self._heuristic_allocation_candidates(
+                expanded_obs, flat_top_routes
+            )
+            zero_search_stat = torch.zeros(
+                heuristic_allocations.size(0),
+                heuristic_allocations.size(1),
+                device=heuristic_allocations.device,
+                dtype=heuristic_allocations.dtype,
+            )
+            candidate_allocations = torch.cat(
+                [heuristic_allocations, candidate_allocations], dim=1
+            )
+            candidate_aux["alloc_refinement_norm"] = torch.cat(
+                [zero_search_stat, candidate_aux["alloc_refinement_norm"]],
+                dim=1,
+            )
+            candidate_aux["pred_noise_norm"] = torch.cat(
+                [zero_search_stat, candidate_aux["pred_noise_norm"]],
+                dim=1,
+            )
+        candidate_allocations = self._mask_allocation(
+            expanded_obs,
+            flat_top_routes,
+            candidate_allocations,
         )
         alloc_candidates = candidate_allocations.size(1)
         allocation_scores = self._estimate_allocation_scores(expanded_obs, flat_top_routes, candidate_allocations)
@@ -858,6 +1169,10 @@ class HybridRoutingPolicy(nn.Module):
         joint_scores = allocation_scores + route_prior_cost.reshape(-1, 1)
 
         joint_scores = joint_scores.reshape(batch_size, route_candidates, alloc_candidates)
+        joint_scores = joint_scores.masked_fill(
+            ~candidate_route_valid.unsqueeze(-1),
+            torch.inf,
+        )
         allocation_scores = allocation_scores.reshape(batch_size, route_candidates, alloc_candidates)
         candidate_allocations = candidate_allocations.reshape(
             batch_size, route_candidates, alloc_candidates, self.alloc_dim

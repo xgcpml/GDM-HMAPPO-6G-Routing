@@ -1,25 +1,26 @@
-# GDM-HMAPPO for THz-Enabled 6G Edge-Cloud Routing
+# GDM-HMAPPO v2 for THz-Enabled 6G Edge-Cloud Routing
 
-This repository contains the clean simulation code for the paper implementation of **Generative Diffusion Model enabled Hierarchical Multi-Agent PPO (GDM-HMAPPO)** for topology-aware routing and computation allocation in dynamic THz-enabled 6G edge-cloud networks.
+This repository provides the clean PyTorch implementation of **GDM-HMAPPO v2** for topology-aware routing and workload allocation in dynamic THz-enabled 6G edge-cloud networks.
 
 ## File Guide
 
 | File | Role |
 | --- | --- |
-| `config.py` | Default simulation, THz channel, task, topology, PPO, and model hyperparameters. The final paper setting is `paper_curve_faithful_long4000`. |
-| `env.py` | Dynamic THz-enabled 6G edge-cloud environment, including wireless/wired communication, computation resources, task generation, latency, reward, and QoS metrics. |
-| `model.py` | Proposed GDM-HMAPPO policy network, including graph encoding, Transformer context modeling, and generative diffusion allocation. It also contains the ablation switches for removing GNN, Transformer, or GDM. |
-| `ppo.py` | PPO rollout collection, optimization, validation, checkpointing, and metric logging for the proposed method. |
-| `main.py` | Training entry for the proposed GDM-HMAPPO and its ablation variants. |
-| `evaluation_tools.py` | Shared checkpoint loading and rollout evaluation utilities. |
-| `evaluate.py` | Standalone evaluation of a trained GDM-HMAPPO checkpoint. |
-| `compare_policies.py` | Simple comparison between the trained policy and lightweight non-learning baselines. |
-| `baselines.py` | Heuristic baseline logic, including the delay-aware load-balanced heuristic used in comparison experiments. |
-| `masac.py`, `run_masac_baseline.py` | MA-SAC benchmark implementation and training entry. |
-| `mapdqn.py`, `run_mapdqn_baseline.py` | MA-P-DQN benchmark implementation and training entry. |
-| `benchmark_sweeps.py` | Final performance-comparison experiment over active task flows and edge-node numbers. |
-| `ablation_sweeps.py` | Final ablation experiment over active task flows for full GDM-HMAPPO, w/o GNN, w/o Transformer, and w/o GDM. |
-| `utils.py` | Minimal utilities for random seeds and CSV/JSON logging. |
+| `config.py` | Simulation, THz channel, topology, task, PPO, and model parameters. |
+| `env.py` | Dynamic communication-computation environment and service metrics. |
+| `model.py` | GNN-Transformer policy with generative diffusion allocation. |
+| `ppo.py` | PPO rollout collection, optimization, validation, and checkpointing. |
+| `main.py` | Training entry for GDM-HMAPPO and GraphPR. |
+| `evaluation_tools.py`, `evaluate.py` | Checkpoint loading and standalone policy evaluation. |
+| `masac.py`, `run_masac_baseline.py` | MA-SAC implementation and training entry. |
+| `mapdqn.py`, `run_mapdqn_baseline.py` | MA-P-DQN implementation and training entry. |
+| `fedroute.py`, `run_fedroute_baseline.py` | FedRoute implementation and training entry. |
+| `baselines.py` | Delay-aware load-balanced heuristic support. |
+| `benchmark_sweeps.py` | Performance comparison over task-flow and edge-node grids. |
+| `evaluate_diffusion_step_sensitivity.py` | Denoising-step comparison. |
+| `profile_inference.py` | Online inference runtime and peak GPU-memory profiling. |
+| `experiment_protocol.py` | Shared experiment grids and run-manifest utilities. |
+| `utils.py` | Seed and metric-output utilities. |
 
 ## Installation
 
@@ -39,112 +40,91 @@ pip install -r requirements.txt
 
 GPU training is recommended. Use `--device cuda` when CUDA-enabled PyTorch is available.
 
-## Train the Proposed Method
+## Convergence Experiment
+
+The following commands train GDM-HMAPPO under three task-flow densities. Each run saves update-level and episode-level reward, latency, and deadline-hit metrics.
 
 ```bash
-python main.py \
-  --preset paper_curve_faithful_long4000 \
-  --device cuda \
-  --output-dir runs/gdm_hmappo
+python main.py --preset v2 --variant proposed --active-flows 26 --device cuda --output-dir runs/convergence_flow26
+python main.py --preset v2 --variant proposed --active-flows 34 --device cuda --output-dir runs/convergence_flow34
+python main.py --preset v2 --variant proposed --active-flows 50 --device cuda --output-dir runs/convergence_flow50
 ```
 
-Main outputs:
+The main output files are `training_history.csv`, `rollout_episode_history.csv`, `evaluation_metrics.json`, `best_routing_model.pt`, and `routing_model_final.pt` in each run directory.
 
-| Output | Description |
-| --- | --- |
-| `runs/gdm_hmappo/best_routing_model.pt` | Best validation checkpoint. |
-| `runs/gdm_hmappo/routing_model_final.pt` | Final model checkpoint. |
-| `runs/gdm_hmappo/training_history.csv` | Training metrics by PPO update. |
-| `runs/gdm_hmappo/rollout_episode_history.csv` | Per-episode rollout metrics. |
-| `runs/gdm_hmappo/evaluation_metrics.json` | Final and best-checkpoint evaluation summary. |
+## Performance Comparison
 
-## Train Benchmark Methods
-
-MA-SAC:
+Train the learning-based methods:
 
 ```bash
-python run_masac_baseline.py \
-  --preset paper_curve_faithful_long4000 \
-  --device cuda \
-  --output-dir runs/masac
+python main.py --preset v2 --variant proposed --device cuda --output-dir runs/gdm_hmappo
+python main.py --preset v2 --variant graphpr --device cuda --output-dir runs/graphpr
+python run_fedroute_baseline.py --preset v2 --device cuda --output-dir runs/fedroute
+python run_masac_baseline.py --preset v2 --device cuda --output-dir runs/masac
+python run_mapdqn_baseline.py --preset v2 --device cuda --output-dir runs/mapdqn
 ```
 
-MA-P-DQN:
-
-```bash
-python run_mapdqn_baseline.py \
-  --preset paper_curve_faithful_long4000 \
-  --device cuda \
-  --output-dir runs/mapdqn
-```
-
-The delay-aware load-balanced heuristic does not require training and is evaluated directly inside `benchmark_sweeps.py`.
-
-## Run Performance Comparison
-
-After training GDM-HMAPPO, MA-SAC, and MA-P-DQN, run:
+Run the common evaluation grids. DALBH is evaluated directly and does not require training.
 
 ```bash
 python benchmark_sweeps.py \
   --run-dir runs/gdm_hmappo \
+  --graphpr-run-dir runs/graphpr \
+  --fedroute-run-dir runs/fedroute \
   --masac-run-dir runs/masac \
   --mapdqn-run-dir runs/mapdqn \
-  --episodes 8 \
-  --num-repeats 20 \
+  --episodes 1 \
+  --num-repeats 4 \
+  --num-topology-repeats 5 \
   --active-flows 18 22 26 30 34 38 42 46 50 \
   --edge-nodes 18 22 26 30 34 38 42 46 50 \
   --output-dir results/performance_comparison
 ```
 
-Important outputs:
+The script saves raw and aggregated CSV files for the default setting, task-flow sweep, and edge-node sweep.
 
-| Output | Description |
-| --- | --- |
-| `default_comparison_aggregated.csv` | Default-setting comparison. |
-| `active_flow_sweep_aggregated.csv` | Comparison under varying active task-flow numbers. |
-| `edge_node_sweep_aggregated.csv` | Comparison under varying edge-node numbers. |
-| `benchmark_sweeps_all_aggregated.csv` | All aggregated performance-comparison results. |
+## Denoising-Step Comparison
 
-## Run Ablation Study
-
-Train the three degraded variants:
+Train matched GDM-HMAPPO policies with 5, 10, and 15 denoising steps:
 
 ```bash
-python main.py --preset paper_curve_faithful_long4000 --device cuda --disable-gnn --output-dir runs/ablation_wo_gnn
-python main.py --preset paper_curve_faithful_long4000 --device cuda --disable-transformer --output-dir runs/ablation_wo_transformer
-python main.py --preset paper_curve_faithful_long4000 --device cuda --disable-gdm --output-dir runs/ablation_wo_gdm
+python main.py --preset v2 --variant proposed --alloc-refinement-steps 5 --device cuda --output-dir runs/gdm_steps5
+python main.py --preset v2 --variant proposed --alloc-refinement-steps 10 --device cuda --output-dir runs/gdm_steps10
+python main.py --preset v2 --variant proposed --alloc-refinement-steps 15 --device cuda --output-dir runs/gdm_steps15
 ```
 
-Then evaluate all variants:
+Evaluate service performance and inference cost:
 
 ```bash
-python ablation_sweeps.py \
-  --full-run-dir runs/gdm_hmappo \
-  --wo-gnn-run-dir runs/ablation_wo_gnn \
-  --wo-transformer-run-dir runs/ablation_wo_transformer \
-  --wo-gdm-run-dir runs/ablation_wo_gdm \
-  --episodes 8 \
-  --num-repeats 20 \
-  --active-flows 18 22 26 30 34 38 42 46 50 \
-  --output-dir results/ablation
+python evaluate_diffusion_step_sensitivity.py \
+  --run-5 runs/gdm_steps5 \
+  --run-10 runs/gdm_steps10 \
+  --run-15 runs/gdm_steps15 \
+  --device cuda \
+  --output-dir results/denoising_steps
 ```
 
-Important outputs:
+## Runtime Test
 
-| Output | Description |
-| --- | --- |
-| `active_flow_ablation.csv` | Raw repeated ablation results. |
-| `active_flow_ablation_aggregated.csv` | Aggregated ablation results used for paper analysis. |
-| `ablation_sweeps_meta.json` | Ablation experiment metadata. |
+Measure online inference runtime per decision slot and peak GPU memory:
+
+```bash
+python profile_inference.py \
+  --proposed-run-dir runs/gdm_hmappo \
+  --masac-run-dir runs/masac \
+  --mapdqn-run-dir runs/mapdqn \
+  --device cuda \
+  --warmup-slots 20 \
+  --measured-slots 100 \
+  --output-dir results/runtime
+```
+
+The profiler saves raw measurements, aggregated summaries, and the complete run configuration. Random seeds and input checkpoints are recorded for reproducibility.
 
 ## Metrics
 
-The main service-oriented metrics saved by the experiment scripts include average end-to-end latency, deadline hit ratio, average latency violation ratio, timely throughput, QoS-aware load balancing index, and peak resource utilization.
+The evaluation scripts report average end-to-end latency, deadline hit ratio, timely throughput, average latency violation ratio, QoS-aware load balancing, peak computational resource utilization, reward, inference runtime, and peak GPU memory where applicable.
 
-The QoS-aware load balancing index is computed as the product of the global load balancing index and the deadline hit ratio.
+## Reproducibility
 
-## Reproducibility Notes
-
-The scripts expose seed controls such as `--seed`, `--seed-base`, `--num-repeats`, and `--repeat-seed-stride`. For paper-style averaged results, use repeated evaluation with fixed checkpoints rather than a single random rollout.
-
-
+Experiment scripts expose deterministic seed controls and save a run manifest containing the command, configuration, software environment, Git commit, checkpoints, and generated artifacts.

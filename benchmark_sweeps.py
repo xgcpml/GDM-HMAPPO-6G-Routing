@@ -5,12 +5,24 @@ import csv
 import json
 from collections import defaultdict
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
+import sys
 
 from env import SimplifiedRoutingEnv
 from evaluation_tools import load_checkpoint, load_run_config, rollout_policy
 from mapdqn import load_mapdqn_policy, load_mapdqn_train_config
 from masac import load_masac_actor, load_masac_train_config
+from experiment_protocol import (
+    ACTIVE_FLOW_GRID,
+    EDGE_NODE_GRID,
+    TOPOLOGY_REPEATS,
+    TRAJECTORY_REPEATS_PER_TOPOLOGY,
+    write_run_manifest,
+)
+
+
+SUPPORTED_POLICIES = ("trained", "masac", "mapdqn", "graphpr", "fedroute", "heuristic")
 
 
 def _scaled_degree(base_degree: int, target_edges: int, reference_edges: int, minimum: int = 1) -> int:
@@ -29,12 +41,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="best_routing_model.pt",
         help="Checkpoint filename for the trained policy.",
     )
-    parser.add_argument("--episodes", type=int, default=16, help="Episodes per sweep point.")
+    parser.add_argument("--episodes", type=int, default=1, help="Episodes per independent evaluation.")
     parser.add_argument("--seed-base", type=int, default=60_000, help="Base seed for deterministic evaluation.")
     parser.add_argument(
         "--num-repeats",
         type=int,
-        default=1,
+        default=TRAJECTORY_REPEATS_PER_TOPOLOGY,
         help="Number of independent repeated evaluations per sweep point.",
     )
     parser.add_argument(
@@ -46,7 +58,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-topology-repeats",
         type=int,
-        default=1,
+        default=TOPOLOGY_REPEATS,
         help="Number of topology seeds to average for each sweep point.",
     )
     parser.add_argument(
@@ -59,14 +71,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--active-flows",
         type=int,
         nargs="*",
-        default=[16, 20, 24, 28, 32],
+        default=list(ACTIVE_FLOW_GRID),
         help="Active flow counts for the load sweep.",
     )
     parser.add_argument(
         "--edge-nodes",
         type=int,
         nargs="*",
-        default=[18, 24, 30, 36, 42],
+        default=list(EDGE_NODE_GRID),
         help="Edge-node counts for the edge-resource sweep.",
     )
     parser.add_argument(
@@ -74,6 +86,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Optional output directory for benchmark sweep artifacts.",
+    )
+    parser.add_argument(
+        "--policies",
+        nargs="+",
+        choices=SUPPORTED_POLICIES,
+        default=None,
+        help="Optional subset of policies to evaluate; defaults to every configured policy.",
     )
     parser.add_argument(
         "--masac-run-dir",
@@ -99,6 +118,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="best_mapdqn_actor.pt",
         help="Checkpoint filename for the MA-P-DQN baseline.",
     )
+    parser.add_argument(
+        "--graphpr-run-dir",
+        type=str,
+        default=None,
+        help="Optional GraphPR run directory.",
+    )
+    parser.add_argument(
+        "--graphpr-checkpoint",
+        type=str,
+        default="best_routing_model.pt",
+        help="Checkpoint filename for GraphPR.",
+    )
+    parser.add_argument(
+        "--fedroute-run-dir",
+        type=str,
+        default=None,
+        help="Optional FedRoute run directory.",
+    )
+    parser.add_argument(
+        "--fedroute-checkpoint",
+        type=str,
+        default="best_fedroute_model.pt",
+        help="Checkpoint filename for FedRoute.",
+    )
     return parser
 
 
@@ -109,13 +152,29 @@ def evaluate_policies(
     seed_base: int,
     masac_policy=None,
     mapdqn_policy=None,
+    graphpr_model=None,
+    fedroute_model=None,
+    policy_names: list[str] | None = None,
 ) -> list[dict[str, float | str]]:
     rows: list[dict[str, float | str]] = []
-    policy_names = ["trained", "heuristic"]
-    if masac_policy is not None:
-        policy_names.append("masac")
-    if mapdqn_policy is not None:
-        policy_names.append("mapdqn")
+    if policy_names is None:
+        policy_names = ["trained"]
+        if masac_policy is not None:
+            policy_names.append("masac")
+        if mapdqn_policy is not None:
+            policy_names.append("mapdqn")
+        if graphpr_model is not None:
+            policy_names.append("graphpr")
+        if fedroute_model is not None:
+            policy_names.append("fedroute")
+        policy_names.append("heuristic")
+    policy_models = {
+        "trained": model,
+        "masac": masac_policy,
+        "mapdqn": mapdqn_policy,
+        "graphpr": graphpr_model,
+        "fedroute": fedroute_model,
+    }
     for policy_name in policy_names:
         env = SimplifiedRoutingEnv(config)
         metrics = rollout_policy(
@@ -124,20 +183,8 @@ def evaluate_policies(
             policy_name=policy_name,
             episodes=episodes,
             seed_base=seed_base,
-            model=(
-                model
-                if policy_name == "trained"
-                else masac_policy
-                if policy_name == "masac"
-                else mapdqn_policy
-                if policy_name == "mapdqn"
-                else None
-            ),
+            model=policy_models.get(policy_name),
         )
-        if "global_load_balancing_index" in metrics and "deadline_hit_ratio" in metrics:
-            metrics["qos_load_balancing_index"] = (
-                float(metrics["global_load_balancing_index"]) * float(metrics["deadline_hit_ratio"])
-            )
         rows.append({"policy": policy_name, **metrics})
     return rows
 
@@ -196,15 +243,21 @@ def aggregate_rows(rows: list[dict[str, float | str]]) -> list[dict[str, float |
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    started_at = datetime.now(timezone.utc).isoformat()
     run_dir = Path(args.run_dir)
     output_dir = Path(args.output_dir) if args.output_dir else run_dir / "benchmark_sweeps"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     base_config = load_run_config(run_dir)
-    model = load_checkpoint(base_config, run_dir, args.checkpoint)
+    requested_policies = args.policies or list(SUPPORTED_POLICIES)
+    model = None
+    if "trained" in requested_policies:
+        model = load_checkpoint(base_config, run_dir, args.checkpoint)
     masac_policy = None
     mapdqn_policy = None
-    if args.masac_run_dir:
+    graphpr_model = None
+    fedroute_model = None
+    if "masac" in requested_policies and args.masac_run_dir:
         masac_run_dir = Path(args.masac_run_dir)
         masac_train_config = load_masac_train_config(masac_run_dir, device=base_config.device)
         masac_policy = load_masac_actor(
@@ -212,13 +265,25 @@ def main() -> None:
             env_config=base_config,
             train_config=masac_train_config,
         )
-    if args.mapdqn_run_dir:
+    if "mapdqn" in requested_policies and args.mapdqn_run_dir:
         mapdqn_run_dir = Path(args.mapdqn_run_dir)
         mapdqn_train_config = load_mapdqn_train_config(mapdqn_run_dir, device=base_config.device)
         mapdqn_policy = load_mapdqn_policy(
             checkpoint_path=mapdqn_run_dir / args.mapdqn_checkpoint,
             env_config=base_config,
             train_config=mapdqn_train_config,
+        )
+    if "graphpr" in requested_policies and args.graphpr_run_dir:
+        graphpr_run_dir = Path(args.graphpr_run_dir)
+        graphpr_config = load_run_config(graphpr_run_dir)
+        graphpr_model = load_checkpoint(
+            graphpr_config, graphpr_run_dir, args.graphpr_checkpoint
+        )
+    if "fedroute" in requested_policies and args.fedroute_run_dir:
+        fedroute_run_dir = Path(args.fedroute_run_dir)
+        fedroute_config = load_run_config(fedroute_run_dir)
+        fedroute_model = load_checkpoint(
+            fedroute_config, fedroute_run_dir, args.fedroute_checkpoint
         )
 
     default_rows: list[dict[str, float | str]] = []
@@ -237,6 +302,9 @@ def main() -> None:
                 + args.repeat_seed_stride * repeat_idx,
                 masac_policy=masac_policy,
                 mapdqn_policy=mapdqn_policy,
+                graphpr_model=graphpr_model,
+                fedroute_model=fedroute_model,
+                policy_names=args.policies,
             )
             for row in rows:
                 row["sweep_type"] = "default"
@@ -265,6 +333,9 @@ def main() -> None:
                     + args.repeat_seed_stride * repeat_idx,
                     masac_policy=masac_policy,
                     mapdqn_policy=mapdqn_policy,
+                    graphpr_model=graphpr_model,
+                    fedroute_model=fedroute_model,
+                    policy_names=args.policies,
                 )
                 for row in rows:
                     row["sweep_type"] = "active_flows"
@@ -310,6 +381,9 @@ def main() -> None:
                     + args.repeat_seed_stride * repeat_idx,
                     masac_policy=masac_policy,
                     mapdqn_policy=mapdqn_policy,
+                    graphpr_model=graphpr_model,
+                    fedroute_model=fedroute_model,
+                    policy_names=args.policies,
                 )
                 for row in rows:
                     row["sweep_type"] = "edge_nodes"
@@ -344,13 +418,37 @@ def main() -> None:
         "topology_seed_stride": args.topology_seed_stride,
         "active_flows": args.active_flows,
         "edge_nodes": args.edge_nodes,
+        "policies": requested_policies,
         "masac_run_dir": args.masac_run_dir,
         "masac_checkpoint": args.masac_checkpoint,
         "mapdqn_run_dir": args.mapdqn_run_dir,
         "mapdqn_checkpoint": args.mapdqn_checkpoint,
+        "graphpr_run_dir": args.graphpr_run_dir,
+        "graphpr_checkpoint": args.graphpr_checkpoint,
+        "fedroute_run_dir": args.fedroute_run_dir,
+        "fedroute_checkpoint": args.fedroute_checkpoint,
     }
     with (output_dir / "benchmark_sweeps_meta.json").open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+    artifact_names = (
+        "default_comparison.csv",
+        "active_flow_sweep.csv",
+        "edge_node_sweep.csv",
+        "benchmark_sweeps_all.csv",
+        "default_comparison_aggregated.csv",
+        "active_flow_sweep_aggregated.csv",
+        "edge_node_sweep_aggregated.csv",
+        "benchmark_sweeps_all_aggregated.csv",
+        "benchmark_sweeps_meta.json",
+    )
+    write_run_manifest(
+        output_dir,
+        base_config,
+        command=[sys.executable, *sys.argv],
+        started_at=started_at,
+        checkpoint=str(run_dir / args.checkpoint),
+        artifacts=artifact_names,
+    )
 
     print("Benchmark sweeps finished.")
     print(f"Output directory: {output_dir.resolve()}")

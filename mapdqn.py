@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from config import ExperimentConfig
 from env import SimplifiedRoutingEnv
-from evaluation_tools import rollout_policy
+from evaluation_tools import rollout_policy, task_observation_from_slot
 from masac import (
     MASAC_CANDIDATE_FEATURE_INDICES,
     batch_obs_to_torch,
@@ -41,10 +41,19 @@ class MAPDQNConfig:
     epsilon_final: float = 0.03
     epsilon_decay_episodes: int = 600
     updates_per_env_step: int = 1
+    update_interval_slots: int = 1
     grad_clip_norm: float = 1.0
     device: str = "cpu"
     checkpoint_name: str = "mapdqn_actor.pt"
     best_checkpoint_name: str = "best_mapdqn_actor.pt"
+
+    def __post_init__(self) -> None:
+        if self.update_interval_slots < 1:
+            raise ValueError("update_interval_slots must be at least 1")
+
+
+def apply_mapdqn_variant(config: ExperimentConfig) -> ExperimentConfig:
+    return replace(config, method_name="MA-P-DQN")
 
 
 class ReplayBuffer:
@@ -55,12 +64,14 @@ class ReplayBuffer:
         self.task_features: np.ndarray | None = None
         self.candidate_features: np.ndarray | None = None
         self.candidate_mask: np.ndarray | None = None
+        self.candidate_alloc_mask: np.ndarray | None = None
         self.route_idx: np.ndarray | None = None
         self.allocation: np.ndarray | None = None
         self.reward: np.ndarray | None = None
         self.next_task_features: np.ndarray | None = None
         self.next_candidate_features: np.ndarray | None = None
         self.next_candidate_mask: np.ndarray | None = None
+        self.next_candidate_alloc_mask: np.ndarray | None = None
         self.done: np.ndarray | None = None
 
     def _ensure_arrays(self, obs: dict[str, np.ndarray], allocation_dim: int) -> None:
@@ -69,6 +80,9 @@ class ReplayBuffer:
         self.task_features = np.zeros((self.capacity, *obs["task_features"].shape), dtype=np.float32)
         self.candidate_features = np.zeros((self.capacity, *obs["candidate_features"].shape), dtype=np.float32)
         self.candidate_mask = np.zeros((self.capacity, *obs["candidate_mask"].shape), dtype=np.float32)
+        self.candidate_alloc_mask = np.zeros(
+            (self.capacity, *obs["candidate_alloc_mask"].shape), dtype=np.float32
+        )
         self.route_idx = np.zeros((self.capacity,), dtype=np.int64)
         self.allocation = np.zeros((self.capacity, allocation_dim), dtype=np.float32)
         self.reward = np.zeros((self.capacity,), dtype=np.float32)
@@ -77,6 +91,9 @@ class ReplayBuffer:
             (self.capacity, *obs["candidate_features"].shape), dtype=np.float32
         )
         self.next_candidate_mask = np.zeros((self.capacity, *obs["candidate_mask"].shape), dtype=np.float32)
+        self.next_candidate_alloc_mask = np.zeros(
+            (self.capacity, *obs["candidate_alloc_mask"].shape), dtype=np.float32
+        )
         self.done = np.zeros((self.capacity,), dtype=np.float32)
 
     def add(
@@ -92,24 +109,28 @@ class ReplayBuffer:
         assert self.task_features is not None
         assert self.candidate_features is not None
         assert self.candidate_mask is not None
+        assert self.candidate_alloc_mask is not None
         assert self.route_idx is not None
         assert self.allocation is not None
         assert self.reward is not None
         assert self.next_task_features is not None
         assert self.next_candidate_features is not None
         assert self.next_candidate_mask is not None
+        assert self.next_candidate_alloc_mask is not None
         assert self.done is not None
 
         idx = self.position
         self.task_features[idx] = obs["task_features"]
         self.candidate_features[idx] = obs["candidate_features"]
         self.candidate_mask[idx] = obs["candidate_mask"]
+        self.candidate_alloc_mask[idx] = obs["candidate_alloc_mask"]
         self.route_idx[idx] = int(route_idx)
         self.allocation[idx] = allocation.astype(np.float32)
         self.reward[idx] = float(reward)
         self.next_task_features[idx] = next_obs["task_features"]
         self.next_candidate_features[idx] = next_obs["candidate_features"]
         self.next_candidate_mask[idx] = next_obs["candidate_mask"]
+        self.next_candidate_alloc_mask[idx] = next_obs["candidate_alloc_mask"]
         self.done[idx] = float(done)
 
         self.position = (self.position + 1) % self.capacity
@@ -121,12 +142,14 @@ class ReplayBuffer:
         assert self.task_features is not None
         assert self.candidate_features is not None
         assert self.candidate_mask is not None
+        assert self.candidate_alloc_mask is not None
         assert self.route_idx is not None
         assert self.allocation is not None
         assert self.reward is not None
         assert self.next_task_features is not None
         assert self.next_candidate_features is not None
         assert self.next_candidate_mask is not None
+        assert self.next_candidate_alloc_mask is not None
         assert self.done is not None
 
         indices = np.random.randint(0, self.size, size=batch_size)
@@ -135,6 +158,7 @@ class ReplayBuffer:
                 "task_features": self.task_features[indices],
                 "candidate_features": self.candidate_features[indices],
                 "candidate_mask": self.candidate_mask[indices],
+                "candidate_alloc_mask": self.candidate_alloc_mask[indices],
             },
             device,
         )
@@ -143,6 +167,7 @@ class ReplayBuffer:
                 "task_features": self.next_task_features[indices],
                 "candidate_features": self.next_candidate_features[indices],
                 "candidate_mask": self.next_candidate_mask[indices],
+                "candidate_alloc_mask": self.next_candidate_alloc_mask[indices],
             },
             device,
         )
@@ -191,11 +216,11 @@ class MAPDQNActor(nn.Module):
         task_context = self.task_encoder(obs["task_features"])
         repeated_task = task_context.unsqueeze(1).expand(-1, self.num_routes, -1)
         alloc_latent = self.alloc_head(torch.cat([repeated_task, candidate_subset], dim=-1))
-        allocations = []
-        for route_idx in range(self.num_routes):
-            selected_candidate = candidate_subset[:, route_idx, :]
-            allocations.append(edge_preferred_allocation(alloc_latent[:, route_idx, :], selected_candidate))
-        return torch.stack(allocations, dim=1)
+        return edge_preferred_allocation(
+            alloc_latent,
+            candidate_subset,
+            obs["candidate_alloc_mask"],
+        )
 
 
 class MAPDQNCritic(nn.Module):
@@ -241,6 +266,9 @@ class MAPDQNPolicyAdapter:
                 obs["candidate_features"], dtype=torch.float32, device=self.device
             ).unsqueeze(0),
             "candidate_mask": torch.as_tensor(obs["candidate_mask"], dtype=torch.float32, device=self.device).unsqueeze(0),
+            "candidate_alloc_mask": torch.as_tensor(
+                obs["candidate_alloc_mask"], dtype=torch.float32, device=self.device
+            ).unsqueeze(0),
         }
         with torch.inference_mode():
             allocations = self.actor(obs_t)
@@ -252,7 +280,7 @@ class MAPDQNPolicyAdapter:
 
 class MAPDQNTrainer:
     def __init__(self, env_config: ExperimentConfig, train_config: MAPDQNConfig, output_dir: Path):
-        self.env_config = env_config
+        self.env_config = apply_mapdqn_variant(env_config)
         self.train_config = train_config
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -284,6 +312,7 @@ class MAPDQNTrainer:
 
         self.buffer = ReplayBuffer(train_config.replay_size)
         self.total_steps = 0
+        self.decision_slots = 0
         self.training_history: list[dict[str, float]] = []
         self.episode_history: list[dict[str, float]] = []
         self.best_eval_score = -float("inf")
@@ -304,12 +333,79 @@ class MAPDQNTrainer:
         rng = np.random.default_rng(self.env_config.seed + 9876)
 
         for episode_idx in range(self.train_config.train_episodes):
-            obs = self.env.reset(seed=self.env_config.seed + episode_idx)
+            obs = (
+                self.env.reset_slot(seed=self.env_config.seed + episode_idx)
+                if self.env_config.use_multi_task_slots
+                else self.env.reset(seed=self.env_config.seed + episode_idx)
+            )
             episode_rewards: list[float] = []
             episode_metrics: list[dict[str, float]] = []
             epsilon = self.current_epsilon(episode_idx)
 
             for _ in range(self.env_config.episode_length):
+                if self.env_config.use_multi_task_slots:
+                    task_observations = [
+                        task_observation_from_slot(obs, task_idx)
+                        for task_idx in range(int(obs["task_features"].shape[0]))
+                    ]
+                    routes: list[int] = []
+                    allocations: list[np.ndarray] = []
+                    for task_obs in task_observations:
+                        if self.total_steps < self.train_config.warmup_steps:
+                            route_probs = np.clip(
+                                task_obs["candidate_mask"].astype(np.float64), 1e-6, None
+                            )
+                            route_probs /= route_probs.sum()
+                            route_idx = int(rng.choice(self.num_routes, p=route_probs))
+                            valid_alloc = task_obs["candidate_alloc_mask"][route_idx]
+                            allocation = rng.random(self.alloc_dim, dtype=np.float32) * valid_alloc
+                            allocation /= np.clip(allocation.sum(), 1e-6, None)
+                        else:
+                            route_idx, allocation = self._select_action(task_obs, epsilon, rng)
+                        routes.append(route_idx)
+                        allocations.append(allocation)
+
+                    next_obs, reward, done, info = self.env.step_slot(
+                        {
+                            "route_idx": np.asarray(routes, dtype=np.int64),
+                            "allocation": np.stack(allocations),
+                        }
+                    )
+                    task_infos = info["task_infos"]
+                    for task_idx, (task_obs, task_info) in enumerate(
+                        zip(task_observations, task_infos)
+                    ):
+                        stored_next_obs = (
+                            zero_observation_like(task_obs)
+                            if done or next_obs is None
+                            else task_observation_from_slot(
+                                next_obs, task_idx % int(next_obs["task_features"].shape[0])
+                            )
+                        )
+                        self.buffer.add(
+                            task_obs,
+                            int(task_info["route_idx"]),
+                            np.asarray(task_info["allocation"], dtype=np.float32),
+                            float(task_info["reward"]),
+                            stored_next_obs,
+                            done,
+                        )
+                    episode_rewards.append(float(reward))
+                    episode_metrics.append(info)
+                    self.total_steps += len(task_observations)
+                    self.decision_slots += 1
+                    if (
+                        len(self.buffer) >= self.train_config.batch_size
+                        and self.total_steps >= self.train_config.warmup_steps
+                        and self.decision_slots % self.train_config.update_interval_slots == 0
+                    ):
+                        for _ in range(self.train_config.updates_per_env_step):
+                            recent_losses.append(self.update_step())
+                    obs = next_obs if next_obs is not None else obs
+                    if done:
+                        break
+                    continue
+
                 if self.total_steps < self.train_config.warmup_steps:
                     route_probs = np.clip(obs["candidate_mask"].astype(np.float64), 1e-6, None)
                     route_probs = route_probs / route_probs.sum()
@@ -327,8 +423,13 @@ class MAPDQNTrainer:
                 episode_metrics.append(info)
                 obs = next_obs if next_obs is not None else zero_observation_like(obs)
                 self.total_steps += 1
+                self.decision_slots += 1
 
-                if len(self.buffer) >= self.train_config.batch_size and self.total_steps >= self.train_config.warmup_steps:
+                if (
+                    len(self.buffer) >= self.train_config.batch_size
+                    and self.total_steps >= self.train_config.warmup_steps
+                    and self.decision_slots % self.train_config.update_interval_slots == 0
+                ):
                     for _ in range(self.train_config.updates_per_env_step):
                         recent_losses.append(self.update_step())
 
@@ -361,6 +462,7 @@ class MAPDQNTrainer:
                 train_row["eval_resource_utilization"] = float(eval_metrics["resource_utilization"])
                 train_row["buffer_size"] = float(len(self.buffer))
                 train_row["total_steps"] = float(self.total_steps)
+                train_row["decision_slots"] = float(self.decision_slots)
                 self.training_history.append(train_row)
                 recent_losses = []
 
@@ -424,6 +526,7 @@ class MAPDQNTrainer:
                         "task_features": obs["task_features"][None, ...],
                         "candidate_features": obs["candidate_features"][None, ...],
                         "candidate_mask": obs["candidate_mask"][None, ...],
+                        "candidate_alloc_mask": obs["candidate_alloc_mask"][None, ...],
                     },
                     self.device,
                 )

@@ -6,9 +6,11 @@ from pathlib import Path
 
 @dataclass
 class ExperimentConfig:
+    method_name: str = "GDM-HMAPPO"
     seed: int = 7
     device: str = "cpu"
     output_dir: str = "outputs"
+    use_multi_task_slots: bool = True
 
     # Units used in the simulator:
     # - rates: Mbps
@@ -22,6 +24,7 @@ class ExperimentConfig:
     num_edges: int = 4
     num_clouds: int = 1
     num_candidate_paths: int = 4
+    candidate_path_selection_mode: str = "completion_diverse"
     path_length: int = 5
     alloc_dim: int = 3
 
@@ -33,6 +36,8 @@ class ExperimentConfig:
     rollout_episodes_per_update: int = 4
     parallel_rollout_envs: int = 1
     parallel_eval_envs: int = 1
+    topology_seed_stride: int = 0
+    eval_topology_seed_offset: int = 1_000_000
     warmup_updates: int = 6
     warmup_batch_size: int = 128
     search_bootstrap_updates: int = 2
@@ -50,8 +55,12 @@ class ExperimentConfig:
     transformer_layers: int = 2
     attention_heads: int = 4
     use_gnn_encoder: bool = True
+    use_graph_attention_encoder: bool = False
     use_transformer_context: bool = True
+    use_global_graph_context: bool = True
+    use_candidate_resource_summaries: bool = True
     use_gdm_allocator: bool = True
+    allocation_policy_family: str = "gdm"
     alloc_refinement_steps: int = 6
     alloc_min_concentration: float = 0.2
     alloc_noise_scale: float = 0.65
@@ -60,6 +69,7 @@ class ExperimentConfig:
     allocation_search_candidates: int = 24
     route_search_candidates: int = 3
     route_search_prior_coef: float = 0.08
+    use_heuristic_search_candidates: bool = True
 
     lr: float = 2.5e-4
     shared_lr_factor: float = 1.0
@@ -104,6 +114,10 @@ class ExperimentConfig:
     search_distill_ramp_fraction: float = 0.0
     use_search_guided_inference: bool = True
     lr_final_factor: float = 0.45
+    exploration_anneal_updates: int = 0
+    learning_rate_anneal_updates: int = 0
+    learning_rate_warmup_updates: int = 0
+    learning_rate_warmup_initial_factor: float = 0.2
     exploration_hold_fraction: float = 0.10
     exploration_decay_power: float = 1.0
     plateau_patience_updates: int = 10
@@ -123,6 +137,10 @@ class ExperimentConfig:
 
     penalty_coeff: float = 3.0
     invalid_path_penalty: float = 0.60
+    slot_duration_s: float = 0.02
+    queue_backlog_threshold_slots: float = 2.0
+    reward_deadline_weight: float = 1.60
+    reward_queue_weight: float = 0.1125
     queue_drain_ratio: float = 0.30
     flow_load_reference: float = 24.0
     edge_count_reference: int = 30
@@ -135,6 +153,8 @@ class ExperimentConfig:
     resource_utilization_weighted: bool = True
     resource_metrics_include_background: bool = False
     resource_metrics_active_only: bool = True
+    resource_metrics_reachable_only: bool = False
+    resource_peak_percentile: float = 95.0
     reward_latency_scale: float = 28.0
     reward_violation_scale: float = 18.0
     reward_queue_penalty_scale: float = 4.0
@@ -173,6 +193,8 @@ class ExperimentConfig:
     noise_figure_db: float = 7.0
     beamforming_gain_db: float = 60.0
     wireless_shadowing_sigma_db: float = 3.0
+    wireless_interference_to_noise: tuple[float, float] = (0.05, 0.30)
+    blockage_residual_rate_ratio: float = 0.02
     wired_propagation_delay_ms: tuple[float, float] = (1.0, 10.0)
     user_access_degree: int = 3
     access_edge_degree: int = 4
@@ -530,6 +552,21 @@ def apply_experiment_preset(config: ExperimentConfig, preset: str) -> Experiment
             reward_latency_scale=40.0,
             reward_violation_scale=64.0,
             reward_queue_penalty_scale=4.5,
+        )
+
+    if normalized == "v2":
+        return replace(
+            apply_experiment_preset(config, "paper_curve_faithful_long4000"),
+            use_multi_task_slots=True,
+            slot_duration_s=0.08,
+            deadline_budget_factor=1.10,
+            candidate_path_selection_mode="cost_diverse",
+            background_queue_scale=0.0,
+            task_load_bias_scale=0.0,
+            deadline_load_tightening=0.0,
+            resource_metrics_edge_only=False,
+            resource_metrics_active_only=False,
+            resource_metrics_reachable_only=True,
         )
 
     raise ValueError(f"Unsupported experiment preset: {preset}")

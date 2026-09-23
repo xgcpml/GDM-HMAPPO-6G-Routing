@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 
@@ -13,8 +13,12 @@ SPEED_OF_LIGHT = 3.0e8
 
 @dataclass(frozen=True)
 class CandidatePath:
-    nodes: tuple[int, int, int, int, int]
-    compute_nodes: tuple[int, int, int]
+    nodes: tuple[int, ...]
+    node_mask: tuple[float, ...]
+    link_mask: tuple[float, ...]
+    compute_nodes: tuple[int, ...]
+    compute_mask: tuple[float, ...]
+    completion_node: int
     propagation_delay: float
 
 
@@ -62,6 +66,7 @@ class SimplifiedRoutingEnv:
         self.base_prop_delay = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
         self.link_distances = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
         self.base_bandwidth_hz = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
+        self.base_wireless_snr = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
 
         self.user_access_neighbors: Dict[int, List[int]] = {user: [] for user in self.user_ids}
         self.access_edge_neighbors: Dict[int, List[int]] = {access: [] for access in self.access_ids}
@@ -80,6 +85,7 @@ class SimplifiedRoutingEnv:
         self.queues = np.zeros(self.num_nodes, dtype=np.float32)
         self.current_rates = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
         self.current_available = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
+        self.current_wireless_sinr = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
         self.current_capacity = np.zeros(self.num_nodes, dtype=np.float32)
         self.observed_rates = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
         self.observed_available = np.zeros((self.num_nodes, self.num_nodes), dtype=np.float32)
@@ -98,6 +104,7 @@ class SimplifiedRoutingEnv:
         self.slot_cloud_pressure = np.ones(config.num_clouds, dtype=np.float32)
         self.active_flow_count = 0
         self.current_task: Dict[str, float] = {}
+        self.current_tasks: list[Dict[str, float]] = []
         self.episode_regime = "balanced"
         self.regime_hot_users: list[int] = []
         self.regime_hot_edges: list[int] = []
@@ -125,16 +132,42 @@ class SimplifiedRoutingEnv:
         self._initialize_observations()
         self._refresh_observations()
         self.current_task = self._sample_task()
+        self.current_tasks = [self.current_task]
         return self._build_observation()
+
+    def reset_slot(self, seed: int | None = None) -> Dict[str, np.ndarray]:
+        """Reset an episode and expose all logical task-flow agents in the first slot."""
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+
+        self.queues.fill(0.0)
+        self.episode_edge_normalized_load.fill(0.0)
+        self.t = 0
+        self._sample_episode_regime()
+        self._initialize_episode_dynamics()
+        self._sample_network_state()
+        self._initialize_observations()
+        self._refresh_observations()
+        self.current_tasks = self._sample_task_batch()
+        self.current_task = self.current_tasks[0]
+        return self._build_slot_observation()
 
     def step(self, action: Dict[str, np.ndarray | int]):
         route_idx = int(action["route_idx"])
-        allocation = self._normalize_allocation(np.asarray(action["allocation"], dtype=np.float32))
+        path = self.candidate_paths[int(self.current_task["source"])][route_idx]
+        allocation = self._normalize_allocation(
+            np.asarray(action["allocation"], dtype=np.float32),
+            path.compute_mask,
+        )
         action_eval = self._evaluate_action(route_idx, allocation)
         reward = float(action_eval["raw_reward"])
         resource_metrics = self._estimate_resource_metrics(action_eval["path"], allocation)
         self._update_episode_edge_load(action_eval["path"], allocation)
         episode_load_balancing_index = self._episode_load_balancing_index()
+        edge_allocation_ratio, cloud_allocation_ratio = self._allocation_type_ratios(
+            action_eval["path"],
+            allocation,
+        )
 
         self._update_queues(action_eval["path"], allocation)
 
@@ -148,13 +181,16 @@ class SimplifiedRoutingEnv:
             "route_idx": route_idx,
             "allocation": allocation.copy(),
             "path_available": float(action_eval["path_available"]),
-            "edge_allocation_ratio": float(allocation[:-1].sum()),
-            "cloud_allocation_ratio": float(allocation[-1]),
+            "edge_allocation_ratio": edge_allocation_ratio,
+            "cloud_allocation_ratio": cloud_allocation_ratio,
             "mean_compute_queue_ratio": float(action_eval["mean_queue_ratio"]),
             "latency_ratio": float(action_eval["latency_ratio"]),
             "latency_violation_ratio": float(action_eval["violation_ratio"]),
             "active_flows": float(self.active_flow_count),
             "timely_throughput": float(action_eval["deadline_hit"] * self.active_flow_count),
+            "timely_completed_workload": float(
+                action_eval["deadline_hit"] * float(self.current_task["compute_load"])
+            ),
             "avg_resource_utilization": float(resource_metrics["avg_resource_utilization"]),
             "peak_resource_utilization": float(resource_metrics["peak_resource_utilization"]),
             "step_load_balancing_index": float(resource_metrics["load_balancing_index"]),
@@ -182,13 +218,250 @@ class SimplifiedRoutingEnv:
 
         return next_obs, float(reward), done, info
 
-    def _update_episode_edge_load(self, path: CandidatePath, allocation: np.ndarray) -> None:
-        compute_load = float(self.current_task["compute_load"])
-        for node_id, alpha in zip(path.compute_nodes, allocation):
+    def step_slot(
+        self,
+        actions: Sequence[Dict[str, np.ndarray | int]] | Dict[str, np.ndarray],
+    ) -> tuple[Dict[str, np.ndarray] | None, float, bool, Dict[str, object]]:
+        """Apply one joint action for every active task and update queues once."""
+        normalized_actions = self._normalize_slot_actions(actions)
+        if len(normalized_actions) != len(self.current_tasks):
+            raise ValueError(
+                f"Expected {len(self.current_tasks)} task actions, got {len(normalized_actions)}."
+            )
+
+        task_evaluations: list[Dict[str, object]] = []
+        arrivals = np.zeros(self.num_nodes, dtype=np.float32)
+        for task, action in zip(self.current_tasks, normalized_actions):
+            route_idx = int(action["route_idx"])
+            source = int(task["source"])
+            available_mask = self._available_candidate_mask(source)
+            if route_idx < 0 or route_idx >= len(available_mask):
+                raise IndexError(f"Route index {route_idx} is outside the candidate set.")
+            if available_mask[route_idx] < 0.5:
+                raise ValueError(
+                    f"Route {route_idx} for source {source} is unavailable in the current slot."
+                )
+
+            path = self.candidate_paths[source][route_idx]
+            allocation = self._normalize_allocation(
+                np.asarray(action["allocation"], dtype=np.float32),
+                path.compute_mask,
+            )
+            action["allocation"] = allocation
+            action_eval = self._evaluate_task_action(task, route_idx, allocation)
+            task_evaluations.append(action_eval)
+            path = action_eval["path"]
+            compute_load = float(task["compute_load"])
+            for node_id, alpha, valid in zip(
+                path.compute_nodes,
+                allocation,
+                path.compute_mask,
+            ):
+                if valid < 0.5:
+                    continue
+                arrivals[node_id] += float(alpha) * compute_load
+            self._update_episode_edge_load(
+                path,
+                allocation,
+                compute_load=compute_load,
+                service_duration=self.config.slot_duration_s,
+            )
+
+        service = np.zeros(self.num_nodes, dtype=np.float32)
+        service[self.compute_ids_array] = (
+            self.current_capacity[self.compute_ids_array] * self.config.slot_duration_s
+        )
+        demand_before_service = self.queues + arrivals
+        resource_metrics = self._estimate_slot_resource_metrics(
+            demand_before_service,
+            service,
+        )
+        self.queues[self.compute_ids_array] = np.maximum(
+            demand_before_service[self.compute_ids_array] - service[self.compute_ids_array],
+            0.0,
+        )
+
+        task_infos = [
+            self._public_task_info(task, action, action_eval)
+            for task, action, action_eval in zip(
+                self.current_tasks,
+                normalized_actions,
+                task_evaluations,
+            )
+        ]
+        rewards = np.asarray(
+            [float(action_eval["raw_reward"]) for action_eval in task_evaluations],
+            dtype=np.float32,
+        )
+        deadline_hits = np.asarray(
+            [float(action_eval["deadline_hit"]) for action_eval in task_evaluations],
+            dtype=np.float32,
+        )
+        compute_workloads = np.asarray(
+            [float(task["compute_load"]) for task in self.current_tasks],
+            dtype=np.float32,
+        )
+        episode_load_balancing_index = self._episode_load_balancing_index()
+        info: Dict[str, object] = {
+            "task_infos": task_infos,
+            "num_tasks": len(task_infos),
+            "active_flows": float(len(task_infos)),
+            "reward": float(rewards.mean()),
+            "raw_reward": float(rewards.mean()),
+            "latency": self._mean_task_metric(task_evaluations, "latency"),
+            "comm_latency": self._mean_task_metric(task_evaluations, "comm_latency"),
+            "comp_latency": self._mean_task_metric(task_evaluations, "comp_latency"),
+            "deadline": self._mean_task_metric(task_evaluations, "deadline"),
+            "violation": self._mean_task_metric(task_evaluations, "violation"),
+            "deadline_hit": float(deadline_hits.mean()),
+            "path_available": 1.0,
+            "timely_throughput": float(deadline_hits.sum()),
+            "timely_completed_workload": float(
+                np.dot(deadline_hits, compute_workloads)
+            ),
+            "latency_violation_ratio": self._mean_task_metric(
+                task_evaluations, "violation_ratio"
+            ),
+            "mean_compute_queue_ratio": self._mean_task_metric(
+                task_evaluations, "mean_queue_ratio"
+            ),
+            "edge_allocation_ratio": float(
+                np.mean([task_info["edge_allocation_ratio"] for task_info in task_infos])
+            ),
+            "cloud_allocation_ratio": float(
+                np.mean([task_info["cloud_allocation_ratio"] for task_info in task_infos])
+            ),
+            "avg_resource_utilization": resource_metrics["avg_resource_utilization"],
+            "peak_resource_utilization": resource_metrics["peak_resource_utilization"],
+            "peak_computation_load_ratio": resource_metrics[
+                "peak_computation_load_ratio"
+            ],
+            "maximum_resource_utilization": resource_metrics[
+                                "maximum_resource_utilization"
+            ],
+            "maximum_computation_load_ratio": resource_metrics[
+                "maximum_computation_load_ratio"
+            ],
+            "step_load_balancing_index": resource_metrics["load_balancing_index"],
+            "global_load_balancing_index": resource_metrics[
+                "global_load_balancing_index"
+            ],
+            "qos_load_balancing_index": float(
+                resource_metrics["global_load_balancing_index"]
+                * deadline_hits.mean()
+            ),
+            "load_balancing_index": float(episode_load_balancing_index),
+            "avg_edge_queue_ratio": resource_metrics["avg_edge_queue_ratio"],
+            "reward_slack_term": self._mean_task_metric(
+                task_evaluations, "reward_slack_term"
+            ),
+            "reward_violation_term": self._mean_task_metric(
+                task_evaluations, "reward_violation_term"
+            ),
+            "reward_queue_term": self._mean_task_metric(
+                task_evaluations, "reward_queue_term"
+            ),
+            "reward_unavailable_term": 0.0,
+            "compute_utilization": resource_metrics["compute_utilization"].copy(),
+            "assigned_compute_workload": arrivals[self.compute_ids_array].copy(),
+            "available_compute_service": service[self.compute_ids_array].copy(),
+            "reachable_compute_mask": np.isin(
+                self.compute_ids_array,
+                self._reachable_compute_node_ids(),
+            ).astype(np.float32),
+        }
+
+        self.t += 1
+        done = self.t >= self.config.episode_length
+        if done:
+            next_obs = None
+        else:
+            self._sample_network_state()
+            self._refresh_observations()
+            self.current_tasks = self._sample_task_batch()
+            self.current_task = self.current_tasks[0]
+            next_obs = self._build_slot_observation()
+
+        return next_obs, float(rewards.mean()), done, info
+
+    def _normalize_slot_actions(
+        self,
+        actions: Sequence[Dict[str, np.ndarray | int]] | Dict[str, np.ndarray],
+    ) -> list[Dict[str, np.ndarray | int]]:
+        if not isinstance(actions, dict):
+            return list(actions)
+
+        route_indices = np.asarray(actions["route_idx"]).reshape(-1)
+        allocations = np.asarray(actions["allocation"], dtype=np.float32)
+        if allocations.ndim == 1:
+            allocations = allocations.reshape(1, -1)
+        if route_indices.size != allocations.shape[0]:
+            raise ValueError("Route and allocation batches must contain the same number of tasks.")
+        return [
+            {
+                "route_idx": int(route_indices[idx]),
+                "allocation": allocations[idx],
+            }
+            for idx in range(route_indices.size)
+        ]
+
+    @staticmethod
+    def _mean_task_metric(task_evaluations: Sequence[Dict[str, object]], key: str) -> float:
+        return float(np.mean([float(item[key]) for item in task_evaluations]))
+
+    def _public_task_info(
+        self,
+        task: Dict[str, float],
+        action: Dict[str, np.ndarray | int],
+        action_eval: Dict[str, object],
+    ) -> Dict[str, object]:
+        path = action_eval["path"]
+        allocation = self._normalize_allocation(
+            np.asarray(action["allocation"], dtype=np.float32),
+            path.compute_mask,
+        )
+        edge_ratio, cloud_ratio = self._allocation_type_ratios(path, allocation)
+        return {
+            "source": int(task["source"]),
+            "route_idx": int(action["route_idx"]),
+            "allocation": allocation.copy(),
+            "latency": float(action_eval["latency"]),
+            "comm_latency": float(action_eval["comm_latency"]),
+            "comp_latency": float(action_eval["comp_latency"]),
+            "deadline": float(action_eval["deadline"]),
+            "violation": float(action_eval["violation"]),
+            "deadline_hit": float(action_eval["deadline_hit"]),
+            "latency_ratio": float(action_eval["latency_ratio"]),
+            "latency_violation_ratio": float(action_eval["violation_ratio"]),
+            "mean_compute_queue_ratio": float(action_eval["mean_queue_ratio"]),
+            "path_available": 1.0,
+            "edge_allocation_ratio": edge_ratio,
+            "cloud_allocation_ratio": cloud_ratio,
+            "reward": float(action_eval["raw_reward"]),
+        }
+
+    def _update_episode_edge_load(
+        self,
+        path: CandidatePath,
+        allocation: np.ndarray,
+        compute_load: float | None = None,
+        service_duration: float | None = None,
+    ) -> None:
+        if compute_load is None:
+            compute_load = float(self.current_task["compute_load"])
+        if service_duration is None:
+            service_duration = float(self.config.queue_drain_ratio)
+        for node_id, alpha, valid in zip(
+            path.compute_nodes,
+            allocation,
+            path.compute_mask,
+        ):
+            if valid < 0.5:
+                continue
             if node_id not in self.edge_ids:
                 continue
             local_idx = int(node_id - self.edge_ids[0])
-            capacity = max(float(self.current_capacity[node_id]) * self.config.queue_drain_ratio, 1e-6)
+            capacity = max(float(self.current_capacity[node_id]) * service_duration, 1e-6)
             self.episode_edge_normalized_load[local_idx] += float(alpha) * compute_load / capacity
 
     def _episode_load_balancing_index(self) -> float:
@@ -203,39 +476,81 @@ class SimplifiedRoutingEnv:
         dominant_share = float(np.max(active_load) / load_sum)
         return float(np.clip(1.0 - dominant_share, 0.0, 1.0))
 
-    def _normalize_allocation(self, allocation: np.ndarray) -> np.ndarray:
+    def _normalize_allocation(
+        self,
+        allocation: np.ndarray,
+        compute_mask: Sequence[float] | None = None,
+    ) -> np.ndarray:
         normalized = np.clip(np.asarray(allocation, dtype=np.float32), 1e-6, None)
+        if compute_mask is not None:
+            mask = np.asarray(compute_mask, dtype=np.float32)
+            if mask.shape != normalized.shape:
+                raise ValueError("Allocation and compute mask shapes must match.")
+            normalized = normalized * mask
+            if float(normalized.sum()) <= 1e-8:
+                normalized = mask.copy()
         normalized = normalized / normalized.sum()
         return normalized.astype(np.float32)
 
+    def _allocation_type_ratios(
+        self,
+        path: CandidatePath,
+        allocation: np.ndarray,
+    ) -> tuple[float, float]:
+        edge_ratio = 0.0
+        cloud_ratio = 0.0
+        for node_id, alpha, valid in zip(
+            path.compute_nodes,
+            allocation,
+            path.compute_mask,
+        ):
+            if valid < 0.5:
+                continue
+            if node_id in self.edge_ids:
+                edge_ratio += float(alpha)
+            elif node_id in self.cloud_ids:
+                cloud_ratio += float(alpha)
+        return edge_ratio, cloud_ratio
+
     def _evaluate_action(self, route_idx: int, allocation: np.ndarray) -> Dict[str, float | int | CandidatePath]:
-        source = int(self.current_task["source"])
+        return self._evaluate_task_action(self.current_task, route_idx, allocation)
+
+    def _evaluate_task_action(
+        self,
+        task: Dict[str, float],
+        route_idx: int,
+        allocation: np.ndarray,
+    ) -> Dict[str, object]:
+        source = int(task["source"])
         chosen_path = self.candidate_paths[source][route_idx]
 
-        comm_latency = self._compute_communication_latency(chosen_path)
-        comp_latency = self._compute_computation_latency(chosen_path, allocation)
+        comm_latency = self._compute_communication_latency(chosen_path, task)
+        comp_latency = self._compute_computation_latency(chosen_path, allocation, task)
         total_latency = comm_latency + comp_latency
 
-        deadline = float(self.current_task["deadline"])
+        deadline = float(task["deadline"])
         violation = max(total_latency - deadline, 0.0)
         deadline_hit = float(violation <= 1e-8)
         path_available = float(self._path_availability(chosen_path))
-        mean_queue_ratio = float(self._mean_queue_ratio(chosen_path.compute_nodes))
+        mean_queue_ratio = float(
+            self._mean_queue_ratio(
+                chosen_path.compute_nodes,
+                chosen_path.compute_mask,
+            )
+        )
         deadline_safe = max(deadline, 1e-6)
         latency_ratio = total_latency / deadline_safe
         violation_ratio = float(
             np.clip(violation / deadline_safe, 0.0, self.config.reward_violation_clip)
         )
-        unavailable_ratio = 1.0 - path_available
-        latency_cost = self.config.reward_latency_scale * latency_ratio
-        violation_cost = self.config.reward_violation_scale * violation_ratio
-        queue_cost = self.config.reward_queue_penalty_scale * mean_queue_ratio
-        unavailable_cost = self.config.reward_unavailability_scale * unavailable_ratio
+        latency_cost = latency_ratio
+        violation_cost = self.config.reward_deadline_weight * violation_ratio
+        queue_cost = self.config.reward_queue_weight * mean_queue_ratio
         reward_slack_term = -latency_cost
         reward_violation_term = -violation_cost
         reward_queue_term = -queue_cost
-        reward_unavailable_term = -unavailable_cost
-        raw_reward = reward_slack_term + reward_violation_term + reward_queue_term + reward_unavailable_term
+        reward_unavailable_term = 0.0
+        raw_reward = reward_slack_term + reward_violation_term + reward_queue_term
         return {
             "path": chosen_path,
             "route_idx": int(route_idx),
@@ -276,7 +591,7 @@ class SimplifiedRoutingEnv:
             for local_idx in np.argsort(distances)[: max(int(self.config.user_access_degree), 1)]:
                 access = self.access_ids[int(local_idx)]
                 distance = float(distances[local_idx])
-                rate, bandwidth_hz = self._wireless_base_rate(distance)
+                rate, bandwidth_hz, snr_linear = self._wireless_base_rate(distance)
                 self._set_link(
                     src=user,
                     dst=access,
@@ -285,6 +600,7 @@ class SimplifiedRoutingEnv:
                     propagation_delay=distance / SPEED_OF_LIGHT,
                     distance=distance,
                     bandwidth_hz=bandwidth_hz,
+                    wireless_snr=snr_linear,
                 )
                 self.user_access_neighbors[user].append(access)
 
@@ -460,7 +776,7 @@ class SimplifiedRoutingEnv:
         chosen_positions = positions[chosen]
         return chosen_positions.astype(np.float32)
 
-    def _wireless_base_rate(self, distance: float) -> tuple[float, float]:
+    def _wireless_base_rate(self, distance: float) -> tuple[float, float, float]:
         distance = max(distance, 10.0)
         bandwidth_ghz = float(self.rng.uniform(*self.config.wireless_bandwidth_ghz))
         bandwidth_hz = bandwidth_ghz * 1.0e9
@@ -480,7 +796,11 @@ class SimplifiedRoutingEnv:
         snr_linear = 10.0 ** ((received_power_dbm - noise_dbm) / 10.0)
         spectral_efficiency = float(np.clip(np.log2(1.0 + snr_linear), 0.4, 7.2))
         rate_mbps = bandwidth_hz / 1.0e6 * spectral_efficiency * 0.68
-        return float(np.clip(rate_mbps, *self.config.user_access_rate)), bandwidth_hz
+        return (
+            float(np.clip(rate_mbps, *self.config.user_access_rate)),
+            bandwidth_hz,
+            float(snr_linear),
+        )
 
     def _wired_delay_from_distance(self, distance: float) -> float:
         min_ms, max_ms = self.config.wired_propagation_delay_ms
@@ -498,6 +818,7 @@ class SimplifiedRoutingEnv:
         propagation_delay: float,
         distance: float,
         bandwidth_hz: float = 0.0,
+        wireless_snr: float = 0.0,
     ) -> None:
         current_rate = float(self.base_rates[src, dst])
         if current_rate > 0.0 and current_rate >= rate:
@@ -508,6 +829,7 @@ class SimplifiedRoutingEnv:
         self.base_prop_delay[src, dst] = propagation_delay
         self.link_distances[src, dst] = distance
         self.base_bandwidth_hz[src, dst] = bandwidth_hz
+        self.base_wireless_snr[src, dst] = wireless_snr
 
     def _sort_neighbors(self) -> None:
         for user, neighbors in self.user_access_neighbors.items():
@@ -548,6 +870,12 @@ class SimplifiedRoutingEnv:
         self.wireless_src = wireless_src.astype(np.int64)
         self.wireless_dst = wireless_dst.astype(np.int64)
         self.wireless_base_rates = self.base_rates[self.wireless_src, self.wireless_dst].astype(np.float32)
+        self.wireless_bandwidth_hz = self.base_bandwidth_hz[
+            self.wireless_src, self.wireless_dst
+        ].astype(np.float64)
+        self.wireless_base_snr = self.base_wireless_snr[
+            self.wireless_src, self.wireless_dst
+        ].astype(np.float64)
         self.wireless_distance_ratio = np.clip(
             self.link_distances[self.wireless_src, self.wireless_dst] / diagonal,
             0.0,
@@ -564,18 +892,34 @@ class SimplifiedRoutingEnv:
         self.wired_base_rates = self.base_rates[self.wired_src, self.wired_dst].astype(np.float32)
 
         self.candidate_nodes_cache: Dict[int, np.ndarray] = {}
+        self.candidate_node_mask_cache: Dict[int, np.ndarray] = {}
         self.candidate_compute_nodes_cache: Dict[int, np.ndarray] = {}
+        self.candidate_compute_mask_cache: Dict[int, np.ndarray] = {}
         self.candidate_link_src_cache: Dict[int, np.ndarray] = {}
         self.candidate_link_dst_cache: Dict[int, np.ndarray] = {}
+        self.candidate_link_mask_cache: Dict[int, np.ndarray] = {}
         self.candidate_static_prior_cache: Dict[int, np.ndarray] = {}
         self.candidate_propagation_norm_cache: Dict[int, np.ndarray] = {}
 
         for user, paths in self.candidate_paths.items():
             nodes = np.asarray([path.nodes for path in paths], dtype=np.int64)
+            node_mask = np.asarray([path.node_mask for path in paths], dtype=np.float32)
             compute_nodes = np.asarray([path.compute_nodes for path in paths], dtype=np.int64)
+            compute_mask = np.asarray([path.compute_mask for path in paths], dtype=np.float32)
+            link_mask = np.asarray([path.link_mask for path in paths], dtype=np.float32)
             static_prior = np.asarray(
                 [
-                    np.clip(self._path_static_cost(path.nodes, path.compute_nodes) / 1.4, 0.0, 1.0)
+                    np.clip(
+                        self._path_static_cost(
+                            path.nodes,
+                            path.compute_nodes,
+                            path.link_mask,
+                            path.compute_mask,
+                        )
+                        / 1.4,
+                        0.0,
+                        1.0,
+                    )
                     for path in paths
                 ],
                 dtype=np.float32,
@@ -585,48 +929,173 @@ class SimplifiedRoutingEnv:
                 dtype=np.float32,
             )
             self.candidate_nodes_cache[user] = nodes
+            self.candidate_node_mask_cache[user] = node_mask
             self.candidate_compute_nodes_cache[user] = compute_nodes
+            self.candidate_compute_mask_cache[user] = compute_mask
             self.candidate_link_src_cache[user] = nodes[:, :-1]
             self.candidate_link_dst_cache[user] = nodes[:, 1:]
+            self.candidate_link_mask_cache[user] = link_mask
             self.candidate_static_prior_cache[user] = static_prior
             self.candidate_propagation_norm_cache[user] = propagation_norm
+
+    def _make_candidate_path(
+        self,
+        actual_nodes: Sequence[int],
+        compute_nodes: Sequence[int],
+    ) -> CandidatePath:
+        if not actual_nodes or not compute_nodes:
+            raise ValueError("Candidate paths require network and computing nodes.")
+        if len(actual_nodes) > self.config.path_length:
+            raise ValueError("Candidate path exceeds the padded path length.")
+        if len(compute_nodes) > self.config.alloc_dim:
+            raise ValueError("Candidate path exceeds the allocation dimension.")
+
+        padded_nodes = list(actual_nodes)
+        padded_nodes.extend(
+            [padded_nodes[-1]] * (self.config.path_length - len(padded_nodes))
+        )
+        padded_compute_nodes = list(compute_nodes)
+        padded_compute_nodes.extend(
+            [padded_compute_nodes[-1]]
+            * (self.config.alloc_dim - len(padded_compute_nodes))
+        )
+        propagation_delay = float(
+            sum(
+                self.base_prop_delay[src, dst]
+                for src, dst in zip(actual_nodes[:-1], actual_nodes[1:])
+            )
+        )
+        return CandidatePath(
+            nodes=tuple(int(node) for node in padded_nodes),
+            node_mask=tuple(
+                [1.0] * len(actual_nodes)
+                + [0.0] * (self.config.path_length - len(actual_nodes))
+            ),
+            link_mask=tuple(
+                [1.0] * (len(actual_nodes) - 1)
+                + [0.0] * (self.config.path_length - len(actual_nodes))
+            ),
+            compute_nodes=tuple(int(node) for node in padded_compute_nodes),
+            compute_mask=tuple(
+                [1.0] * len(compute_nodes)
+                + [0.0] * (self.config.alloc_dim - len(compute_nodes))
+            ),
+            completion_node=int(actual_nodes[-1]),
+            propagation_delay=propagation_delay,
+        )
+
+    def _candidate_nominal_cost(self, path: CandidatePath) -> float:
+        return self._path_static_cost(
+            path.nodes,
+            path.compute_nodes,
+            path.link_mask,
+            path.compute_mask,
+        )
 
     def _build_candidate_paths(self) -> Dict[int, List[CandidatePath]]:
         candidate_paths: Dict[int, List[CandidatePath]] = {}
         for user in self.user_ids:
             ranked_paths: list[tuple[float, CandidatePath]] = []
-            seen_paths: set[tuple[int, int, int, int, int]] = set()
+            seen_paths: set[tuple[int, ...]] = set()
 
             for access in self.user_access_neighbors[user]:
                 for edge_1 in self.access_edge_neighbors[access]:
+                    edge_nodes = (user, access, edge_1)
+                    if edge_nodes not in seen_paths and self._path_exists(edge_nodes):
+                        seen_paths.add(edge_nodes)
+                        edge_path = self._make_candidate_path(
+                            edge_nodes,
+                            compute_nodes=(edge_1,),
+                        )
+                        ranked_paths.append(
+                            (self._candidate_nominal_cost(edge_path), edge_path)
+                        )
+
                     for edge_2 in self.edge_edge_neighbors[edge_1]:
                         if edge_2 == edge_1:
                             continue
+                        two_edge_nodes = (user, access, edge_1, edge_2)
+                        if (
+                            two_edge_nodes not in seen_paths
+                            and self._path_exists(two_edge_nodes)
+                        ):
+                            seen_paths.add(two_edge_nodes)
+                            two_edge_path = self._make_candidate_path(
+                                two_edge_nodes,
+                                compute_nodes=(edge_1, edge_2),
+                            )
+                            ranked_paths.append(
+                                (
+                                    self._candidate_nominal_cost(two_edge_path),
+                                    two_edge_path,
+                                )
+                            )
+
                         for cloud in self.edge_cloud_neighbors[edge_2]:
                             nodes = (user, access, edge_1, edge_2, cloud)
                             if nodes in seen_paths or not self._path_exists(nodes):
                                 continue
                             seen_paths.add(nodes)
-                            compute_nodes = (edge_1, edge_2, cloud)
-                            propagation_delay = float(
-                                sum(self.base_prop_delay[src, dst] for src, dst in zip(nodes[:-1], nodes[1:]))
+                            cloud_path = self._make_candidate_path(
+                                nodes,
+                                compute_nodes=(edge_1, edge_2, cloud),
                             )
-                            path = CandidatePath(
-                                nodes=nodes,
-                                compute_nodes=compute_nodes,
-                                propagation_delay=propagation_delay,
+                            ranked_paths.append(
+                                (
+                                    self._candidate_nominal_cost(cloud_path),
+                                    cloud_path,
+                                )
                             )
-                            ranked_paths.append((self._path_static_cost(nodes, compute_nodes), path))
 
             if not ranked_paths:
                 raise RuntimeError(f"No candidate path could be constructed for user {user}.")
 
             ranked_paths.sort(key=lambda item: item[0])
-            selected = self._select_diverse_candidate_subset(ranked_paths)
+            if self.config.candidate_path_selection_mode == "cost_diverse":
+                selected = self._select_diverse_candidate_subset(ranked_paths)
+            elif self.config.candidate_path_selection_mode == "completion_diverse":
+                selected = self._select_completion_diverse_paths(ranked_paths)
+            else:
+                raise ValueError(
+                    "Unsupported candidate path selection mode: "
+                    f"{self.config.candidate_path_selection_mode}"
+                )
             while len(selected) < self.config.num_candidate_paths:
                 selected.append(selected[len(selected) % len(selected)])
             candidate_paths[user] = selected[: self.config.num_candidate_paths]
         return candidate_paths
+
+    def _select_completion_diverse_paths(
+        self,
+        ranked_paths: list[tuple[float, CandidatePath]],
+    ) -> list[CandidatePath]:
+        target = max(int(self.config.num_candidate_paths), 1)
+        selected: list[CandidatePath] = []
+        selected_nodes: set[tuple[int, ...]] = set()
+
+        categories = (
+            lambda path: sum(path.node_mask) == 3,
+            lambda path: sum(path.node_mask) == 4,
+            lambda path: self.node_types[path.completion_node] == 3,
+        )
+        for predicate in categories:
+            if len(selected) >= target:
+                break
+            for _, path in ranked_paths:
+                if predicate(path) and path.nodes not in selected_nodes:
+                    selected.append(path)
+                    selected_nodes.add(path.nodes)
+                    break
+
+        for _, path in ranked_paths:
+            if len(selected) >= target:
+                break
+            if path.nodes in selected_nodes:
+                continue
+            selected.append(path)
+            selected_nodes.add(path.nodes)
+
+        return selected
 
     def _select_diverse_candidate_subset(
         self,
@@ -636,8 +1105,28 @@ class SimplifiedRoutingEnv:
         if len(ranked_paths) <= target:
             return [path for _, path in ranked_paths]
 
-        best_keep = min(2, target)
-        selected_indices = list(range(best_keep))
+        selected_indices: list[int] = []
+        completion_categories = (
+            lambda path: sum(path.node_mask) == 3,
+            lambda path: sum(path.node_mask) == 4,
+            lambda path: self.node_types[path.completion_node] == 3,
+        )
+        for predicate in completion_categories:
+            if len(selected_indices) >= target:
+                break
+            for idx, (_, path) in enumerate(ranked_paths):
+                if idx not in selected_indices and predicate(path):
+                    selected_indices.append(idx)
+                    break
+
+        # Keep most choices close to the nominal optimum, then use the
+        # remaining budget for topology diversity. This avoids turning the
+        # candidate pool into an artificially difficult routing problem.
+        best_keep = min(7, target)
+        for idx in range(best_keep):
+            if idx not in selected_indices:
+                selected_indices.append(idx)
+
         selected_access = {ranked_paths[idx][1].nodes[1] for idx in selected_indices}
         selected_edge_1 = {ranked_paths[idx][1].nodes[2] for idx in selected_indices}
         selected_edge_2 = {ranked_paths[idx][1].nodes[3] for idx in selected_indices}
@@ -698,7 +1187,7 @@ class SimplifiedRoutingEnv:
         selected_indices = sorted(selected_indices[:target])
         return [ranked_paths[idx][1] for idx in selected_indices]
 
-    def _path_exists(self, nodes: tuple[int, int, int, int, int]) -> bool:
+    def _path_exists(self, nodes: Sequence[int]) -> bool:
         for src, dst in zip(nodes[:-1], nodes[1:]):
             if self.base_rates[src, dst] <= 0.0:
                 return False
@@ -706,18 +1195,32 @@ class SimplifiedRoutingEnv:
 
     def _path_static_cost(
         self,
-        nodes: tuple[int, int, int, int, int],
-        compute_nodes: tuple[int, int, int],
+        nodes: Sequence[int],
+        compute_nodes: Sequence[int],
+        link_mask: Sequence[float] | None = None,
+        compute_mask: Sequence[float] | None = None,
     ) -> float:
         mean_data = 0.5 * sum(self.config.task_data_range)
         mean_compute = 0.5 * sum(self.config.task_compute_range)
         comm_cost = 0.0
-        for src, dst in zip(nodes[:-1], nodes[1:]):
+        if link_mask is None:
+            link_mask = [1.0] * max(len(nodes) - 1, 0)
+        for src, dst, valid in zip(nodes[:-1], nodes[1:], link_mask):
+            if valid < 0.5:
+                continue
             comm_cost += float(self.base_prop_delay[src, dst]) + mean_data / max(float(self.base_rates[src, dst]), 1e-6)
 
         compute_cost = 0.0
-        for node_id in compute_nodes:
-            compute_cost += (mean_compute / self.config.alloc_dim) / max(float(self.base_capacity[node_id]), 1e-6)
+        if compute_mask is None:
+            compute_mask = [1.0] * len(compute_nodes)
+        valid_compute_count = max(float(np.sum(compute_mask)), 1.0)
+        for node_id, valid in zip(compute_nodes, compute_mask):
+            if valid < 0.5:
+                continue
+            compute_cost += (mean_compute / valid_compute_count) / max(
+                float(self.base_capacity[node_id]),
+                1e-6,
+            )
 
         return float(comm_cost + 0.45 * compute_cost)
 
@@ -907,6 +1410,7 @@ class SimplifiedRoutingEnv:
         self._sample_slot_profile()
         full_node_pressure = self._compose_full_node_pressure()
         self.current_rates.fill(0.0)
+        self.current_wireless_sinr.fill(0.0)
 
         if self.wireless_src.size > 0:
             access_pressure = self.slot_access_pressure[self.wireless_dst_access_idx]
@@ -918,7 +1422,7 @@ class SimplifiedRoutingEnv:
             blockage_prob = np.clip(
                 blockage_prob + 0.004 * variation * self.hot_user_mask[self.wireless_src],
                 0.02,
-                0.09,
+                0.95,
             ).astype(np.float32)
 
             prev_available = self.current_available[self.wireless_src, self.wireless_dst] >= 0.5
@@ -927,29 +1431,41 @@ class SimplifiedRoutingEnv:
                 0.35 * blockage_prob,
                 blockage_prob,
             )
-            target_scale = self.rng.uniform(
+            fading_power = self.rng.uniform(
                 self.config.wireless_rate_jitter[0],
                 self.config.wireless_rate_jitter[1],
                 size=self.wireless_src.size,
-            ).astype(np.float32)
-            target_scale *= self.rng.lognormal(
+            ).astype(np.float64)
+            fading_power *= self.rng.lognormal(
                 mean=0.0,
                 sigma=0.12 * (0.55 + 0.45 * variation),
                 size=self.wireless_src.size,
-            ).astype(np.float32)
-            target_scale *= 1.0 / (
+            ).astype(np.float64)
+            interference_to_noise = self.rng.uniform(
+                *self.config.wireless_interference_to_noise,
+                size=self.wireless_src.size,
+            ).astype(np.float64)
+            interference_to_noise *= 1.0 + access_pressure + 0.25 * user_pressure
+            effective_sinr = self.wireless_base_snr * fading_power / (
+                1.0 + interference_to_noise
+            )
+            spectral_efficiency = np.clip(np.log2(1.0 + effective_sinr), 0.0, 7.2)
+            target_rate = (
+                self.wireless_bandwidth_hz / 1.0e6 * spectral_efficiency * 0.68
+            )
+            target_rate *= 1.0 / (
                 1.0
                 + self.config.access_contention_scale * access_pressure
                 + 0.06 * user_pressure
             )
             if self.episode_regime == "wireless_stress":
-                target_scale *= self._variation_factor(0.96)
-            blocked_scale = self.rng.uniform(
-                self._variation_factor(0.78),
-                self._variation_factor(0.92),
-                size=self.wireless_src.size,
+                target_rate *= self._variation_factor(0.96)
+            target_rate = np.clip(
+                target_rate,
+                self.config.user_access_rate[0],
+                self.config.user_access_rate[1],
             ).astype(np.float32)
-            target_scale = np.where(blocked, target_scale * blocked_scale, target_scale)
+            target_scale = target_rate / np.maximum(self.wireless_base_rates, 1e-6)
 
             prev_scale = self.rate_multipliers[self.wireless_src, self.wireless_dst]
             updated_scale = (
@@ -957,10 +1473,13 @@ class SimplifiedRoutingEnv:
                 + (1.0 - self.config.temporal_rate_momentum) * target_scale
             )
             updated_scale = np.clip(updated_scale, 0.08, 1.25).astype(np.float32)
+            residual_scale = float(np.clip(self.config.blockage_residual_rate_ratio, 0.0, 0.1))
+            updated_scale = np.where(blocked, residual_scale, updated_scale).astype(np.float32)
             self.rate_multipliers[self.wireless_src, self.wireless_dst] = updated_scale
             self.current_rates[self.wireless_src, self.wireless_dst] = self.wireless_base_rates * updated_scale
-            self.current_available[self.wireless_src, self.wireless_dst] = (
-                self.current_rates[self.wireless_src, self.wireless_dst] >= 0.18 * self.wireless_base_rates
+            self.current_available[self.wireless_src, self.wireless_dst] = (~blocked).astype(np.float32)
+            self.current_wireless_sinr[self.wireless_src, self.wireless_dst] = np.where(
+                blocked, 0.0, effective_sinr
             ).astype(np.float32)
 
         if self.wired_src.size > 0:
@@ -1038,9 +1557,33 @@ class SimplifiedRoutingEnv:
         pressure[self.cloud_ids] = self.slot_cloud_pressure
         return pressure
 
-    def _sample_task(self) -> Dict[str, float]:
-        source_probs = self.slot_user_pressure / max(float(self.slot_user_pressure.sum()), 1e-6)
-        source = int(self.rng.choice(self.user_ids, p=source_probs))
+    def _eligible_task_sources(self) -> list[int]:
+        return [
+            user
+            for user in self.user_ids
+            if bool(np.any(self._available_candidate_mask(user) > 0.5))
+        ]
+
+    def _sample_task_batch(self) -> list[Dict[str, float]]:
+        eligible_sources = self._eligible_task_sources()
+        if not eligible_sources:
+            raise RuntimeError("No user has an available candidate service path in this slot.")
+        return [
+            self._sample_task(eligible_sources=eligible_sources)
+            for _ in range(max(int(self.active_flow_count), 1))
+        ]
+
+    def _sample_task(
+        self,
+        eligible_sources: Sequence[int] | None = None,
+    ) -> Dict[str, float]:
+        source_pool = list(eligible_sources) if eligible_sources is not None else self._eligible_task_sources()
+        if not source_pool:
+            raise RuntimeError("No eligible task source is available.")
+        source_indices = np.asarray(source_pool, dtype=np.int64)
+        source_weights = self.slot_user_pressure[source_indices]
+        source_probs = source_weights / max(float(source_weights.sum()), 1e-6)
+        source = int(self.rng.choice(source_indices, p=source_probs))
 
         data_low, data_high = self.config.task_data_range
         comp_low, comp_high = self.config.task_compute_range
@@ -1141,7 +1684,12 @@ class SimplifiedRoutingEnv:
         if self.compute_ids_array.size > 0:
             capacity = np.clip(self.current_capacity[self.compute_ids_array], 1e-6, None)
             queue_pressure[self.compute_ids_array] = np.clip(
-                self.queues[self.compute_ids_array] / (capacity * 2.4),
+                self.queues[self.compute_ids_array]
+                / (
+                    capacity
+                    * self.config.slot_duration_s
+                    * self.config.queue_backlog_threshold_slots
+                ),
                 0.0,
                 1.0,
             ).astype(np.float32)
@@ -1201,10 +1749,18 @@ class SimplifiedRoutingEnv:
     def _encode_trend(current: np.ndarray | float, previous: np.ndarray | float, gain: float = 2.5):
         return np.clip(0.5 + gain * (np.asarray(current) - np.asarray(previous)), 0.0, 1.0).astype(np.float32)
 
-    def _compute_communication_latency(self, path: CandidatePath) -> float:
-        data_size = float(self.current_task["data_size"])
+    def _compute_communication_latency(
+        self,
+        path: CandidatePath,
+        task: Dict[str, float] | None = None,
+    ) -> float:
+        if task is None:
+            task = self.current_task
+        data_size = float(task["data_size"])
         latency = 0.0
-        for src, dst in zip(path.nodes[:-1], path.nodes[1:]):
+        for src, dst, valid in zip(path.nodes[:-1], path.nodes[1:], path.link_mask):
+            if valid < 0.5:
+                continue
             base_rate = max(float(self.base_rates[src, dst]), 1e-6)
             rate = max(float(self.current_rates[src, dst]), 0.05 * base_rate)
             latency += float(self.base_prop_delay[src, dst]) + data_size / rate
@@ -1212,10 +1768,23 @@ class SimplifiedRoutingEnv:
                 latency += self.config.invalid_path_penalty
         return latency
 
-    def _compute_computation_latency(self, path: CandidatePath, allocation: np.ndarray) -> float:
-        compute_load = float(self.current_task["compute_load"])
+    def _compute_computation_latency(
+        self,
+        path: CandidatePath,
+        allocation: np.ndarray,
+        task: Dict[str, float] | None = None,
+    ) -> float:
+        if task is None:
+            task = self.current_task
+        compute_load = float(task["compute_load"])
         latency = 0.0
-        for node_id, alpha in zip(path.compute_nodes, allocation):
+        for node_id, alpha, valid in zip(
+            path.compute_nodes,
+            allocation,
+            path.compute_mask,
+        ):
+            if valid < 0.5:
+                continue
             capacity = max(float(self.current_capacity[node_id]), 1e-6)
             queue_delay = float(self.queues[node_id]) / capacity
             service_delay = float(alpha) * compute_load / capacity
@@ -1232,8 +1801,13 @@ class SimplifiedRoutingEnv:
             self.queues[self.compute_ids_array] += self.background_queue_arrivals[self.compute_ids_array]
 
         compute_load = float(self.current_task["compute_load"])
-        path_compute_nodes = np.asarray(path.compute_nodes, dtype=np.int64)
-        self.queues[path_compute_nodes] += allocation.astype(np.float32) * compute_load
+        for node_id, alpha, valid in zip(
+            path.compute_nodes,
+            allocation,
+            path.compute_mask,
+        ):
+            if valid >= 0.5:
+                self.queues[node_id] += float(alpha) * compute_load
 
     def _estimate_resource_metrics(self, path: CandidatePath, allocation: np.ndarray) -> Dict[str, float]:
         def compute_load_balance(node_ids: np.ndarray) -> float:
@@ -1249,7 +1823,13 @@ class SimplifiedRoutingEnv:
                 demand += self.background_queue_arrivals[node_ids].astype(np.float32)
             local_index = {int(node_id): idx for idx, node_id in enumerate(node_ids.tolist())}
             compute_load = float(self.current_task["compute_load"])
-            for node_id, alpha in zip(path.compute_nodes, allocation):
+            for node_id, alpha, valid in zip(
+                path.compute_nodes,
+                allocation,
+                path.compute_mask,
+            ):
+                if valid < 0.5:
+                    continue
                 idx = local_index.get(int(node_id))
                 if idx is None:
                     continue
@@ -1292,7 +1872,13 @@ class SimplifiedRoutingEnv:
         metric_local_index = {int(node_id): idx for idx, node_id in enumerate(metric_node_ids.tolist())}
 
         compute_load = float(self.current_task["compute_load"])
-        for node_id, alpha in zip(path.compute_nodes, allocation):
+        for node_id, alpha, valid in zip(
+            path.compute_nodes,
+            allocation,
+            path.compute_mask,
+        ):
+            if valid < 0.5:
+                continue
             local_idx = metric_local_index.get(int(node_id))
             if local_idx is None:
                 continue
@@ -1327,7 +1913,13 @@ class SimplifiedRoutingEnv:
             if getattr(self.config, "resource_metrics_include_background", False):
                 edge_demand += self.background_queue_arrivals[self.edge_ids_array].astype(np.float32)
             edge_local_index = {int(node_id): idx for idx, node_id in enumerate(self.edge_ids_array.tolist())}
-            for node_id, alpha in zip(path.compute_nodes, allocation):
+            for node_id, alpha, valid in zip(
+                path.compute_nodes,
+                allocation,
+                path.compute_mask,
+            ):
+                if valid < 0.5:
+                    continue
                 local_idx = edge_local_index.get(int(node_id))
                 if local_idx is None:
                     continue
@@ -1346,33 +1938,173 @@ class SimplifiedRoutingEnv:
             "avg_edge_queue_ratio": float(edge_queue_ratio),
         }
 
+    def _estimate_slot_resource_metrics(
+        self,
+        demand_before_service: np.ndarray,
+        service: np.ndarray,
+    ) -> Dict[str, object]:
+        def load_ratio_for(node_ids: np.ndarray) -> np.ndarray:
+            if node_ids.size == 0:
+                return np.zeros(0, dtype=np.float32)
+            return (
+                demand_before_service[node_ids]
+                / np.clip(service[node_ids], 1e-6, None)
+            ).astype(np.float32)
+
+        def utilization_for(node_ids: np.ndarray) -> np.ndarray:
+            return np.clip(load_ratio_for(node_ids), 0.0, 1.0)
+
+        def jain_index(values: np.ndarray) -> float:
+            if values.size == 0:
+                return 0.0
+            if self.config.resource_metrics_active_only:
+                active = values > 1e-8
+                if np.any(active):
+                    values = values[active]
+            squared_sum = float(np.square(values).sum())
+            if squared_sum <= 1e-8:
+                return 0.0
+            return float(float(values.sum()) ** 2 / (float(values.size) * squared_sum))
+
+        metric_node_ids = self.compute_ids_array
+        if self.config.resource_metrics_reachable_only:
+            metric_node_ids = self._reachable_compute_node_ids()
+        if self.config.resource_metrics_edge_only and self.edge_ids_array.size > 0:
+            metric_node_ids = np.intersect1d(
+                metric_node_ids,
+                self.edge_ids_array,
+                assume_unique=True,
+            )
+        metric_load_ratio = load_ratio_for(metric_node_ids)
+        if self.config.resource_metrics_active_only and metric_load_ratio.size > 0:
+            active = demand_before_service[metric_node_ids] > 1e-8
+            if np.any(active):
+                metric_load_ratio = metric_load_ratio[active]
+        metric_utilization = np.clip(metric_load_ratio, 0.0, 1.0)
+
+        if metric_utilization.size == 0:
+            average_utilization = 0.0
+            peak_load_ratio = 0.0
+            maximum_load_ratio = 0.0
+        else:
+            average_utilization = float(np.mean(metric_utilization))
+            percentile = float(np.clip(self.config.resource_peak_percentile, 0.0, 100.0))
+            peak_load_ratio = float(np.percentile(metric_load_ratio, percentile))
+            maximum_load_ratio = float(np.max(metric_load_ratio))
+
+        edge_queue_ratio = 0.0
+        if self.edge_ids_array.size > 0:
+            edge_backlog = np.maximum(
+                demand_before_service[self.edge_ids_array] - service[self.edge_ids_array],
+                0.0,
+            )
+            edge_threshold = np.clip(
+                service[self.edge_ids_array] * self.config.queue_backlog_threshold_slots,
+                1e-6,
+                None,
+            )
+            edge_queue_ratio = float(
+                np.mean(np.clip(edge_backlog / edge_threshold, 0.0, 3.0))
+            )
+
+        return {
+            "avg_resource_utilization": average_utilization,
+            "peak_resource_utilization": peak_load_ratio,
+            "peak_computation_load_ratio": peak_load_ratio,
+            "maximum_resource_utilization": maximum_load_ratio,
+            "maximum_computation_load_ratio": maximum_load_ratio,
+            "load_balancing_index": jain_index(metric_load_ratio),
+            "global_load_balancing_index": jain_index(metric_load_ratio),
+            "avg_edge_queue_ratio": edge_queue_ratio,
+            "compute_utilization": utilization_for(self.compute_ids_array),
+        }
+
+    def _reachable_compute_node_ids(self) -> np.ndarray:
+        reachable: set[int] = set()
+        for task in self.current_tasks:
+            source = int(task["source"])
+            for path in self.candidate_paths[source]:
+                if not self._path_availability(path):
+                    continue
+                for node_id, valid in zip(path.compute_nodes, path.compute_mask):
+                    if valid >= 0.5:
+                        reachable.add(int(node_id))
+        if not reachable:
+            return self.compute_ids_array
+        return np.asarray(sorted(reachable), dtype=np.int64)
+
     def _path_availability(self, path: CandidatePath) -> bool:
-        for src, dst in zip(path.nodes[:-1], path.nodes[1:]):
+        for src, dst, valid in zip(path.nodes[:-1], path.nodes[1:], path.link_mask):
+            if valid < 0.5:
+                continue
             if self.current_available[src, dst] < 0.5:
                 return False
         return True
 
-    def _mean_queue_ratio(self, compute_nodes: tuple[int, int, int]) -> float:
+    def _available_candidate_mask(self, source: int) -> np.ndarray:
+        return np.asarray(
+            [
+                1.0 if self._path_availability(path) else 0.0
+                for path in self.candidate_paths[source]
+            ],
+            dtype=np.float32,
+        )
+
+    def _mean_queue_ratio(
+        self,
+        compute_nodes: Sequence[int],
+        compute_mask: Sequence[float] | None = None,
+    ) -> float:
         nodes = np.asarray(compute_nodes, dtype=np.int64)
-        capacity = np.clip(self.current_capacity[nodes], 1e-6, None)
-        ratios = self.queues[nodes] / (capacity * 2.0)
+        if compute_mask is not None:
+            nodes = nodes[np.asarray(compute_mask, dtype=np.float32) > 0.5]
+        threshold = np.clip(
+            self.current_capacity[nodes]
+            * self.config.slot_duration_s
+            * self.config.queue_backlog_threshold_slots,
+            1e-6,
+            None,
+        )
+        ratios = self.queues[nodes] / threshold
         return float(np.mean(ratios))
 
-    def _build_observation(self) -> Dict[str, np.ndarray]:
-        node_features = self._build_node_features()
+    def _build_slot_observation(self) -> Dict[str, np.ndarray]:
+        task_observations = [
+            self._build_observation(task=task, include_source_marker=False)
+            for task in self.current_tasks
+        ]
+        return {
+            key: np.stack([observation[key] for observation in task_observations], axis=0)
+            for key in task_observations[0]
+        }
+
+    def _build_observation(
+        self,
+        task: Dict[str, float] | None = None,
+        include_source_marker: bool = True,
+    ) -> Dict[str, np.ndarray]:
+        if task is None:
+            task = self.current_task
+        source = int(task["source"])
+        node_features = self._build_node_features(
+            source=source if include_source_marker else None
+        )
         task_features = np.asarray(
             [
-                self.current_task["source"] / max(self.config.num_users - 1, 1),
-                self.current_task["data_size"] / self.config.task_data_range[1],
-                self.current_task["compute_load"] / self.config.task_compute_range[1],
-                self.current_task["deadline"] / self.config.max_deadline_scale,
-                self.active_flow_count / max(float(self.config.active_flow_range[1]), 1.0),
+                task["source"] / max(self.config.num_users - 1, 1),
+                task["data_size"] / self.config.task_data_range[1],
+                task["compute_load"] / self.config.task_compute_range[1],
+                task["deadline"] / self.config.max_deadline_scale,
+                np.clip(
+                    self.active_flow_count / self._flow_reference(),
+                    0.0,
+                    2.5,
+                ),
                 np.clip(self.regime_intensity / 1.2, 0.0, 1.0),
             ],
             dtype=np.float32,
         )
 
-        source = int(self.current_task["source"])
         path_nodes, candidate_features, candidate_mask = self._build_candidate_feature_bundle(source)
 
         return {
@@ -1382,11 +2114,15 @@ class SimplifiedRoutingEnv:
             "candidate_features": candidate_features.astype(np.float32),
             "candidate_mask": candidate_mask.astype(np.float32),
             "candidate_nodes": path_nodes.astype(np.int64),
+            "candidate_compute_nodes": self.candidate_compute_nodes_cache[source].copy(),
+            "candidate_node_mask": self.candidate_node_mask_cache[source].copy(),
+            "candidate_link_mask": self.candidate_link_mask_cache[source].copy(),
+            "candidate_alloc_mask": self.candidate_compute_mask_cache[source].copy(),
+            "source_node": np.asarray(source, dtype=np.int64),
         }
 
-    def _build_node_features(self) -> np.ndarray:
+    def _build_node_features(self, source: int | None = None) -> np.ndarray:
         node_features = np.zeros((self.num_nodes, self.config.node_feature_dim), dtype=np.float32)
-        source = int(self.current_task.get("source", 0))
         node_features[self.node_ids, self.node_types] = 1.0
         node_features[:, 4] = self.observed_capacity
         node_features[:, 5] = self.observed_queue_pressure
@@ -1402,7 +2138,8 @@ class SimplifiedRoutingEnv:
             self.observed_queue_pressure,
             self.prev_observed_queue_pressure,
         )
-        node_features[source, 6] = 1.0
+        if source is not None:
+            node_features[source, 6] = 1.0
 
         return node_features
 
@@ -1411,30 +2148,48 @@ class SimplifiedRoutingEnv:
         compute_nodes = self.candidate_compute_nodes_cache[source]
         link_src = self.candidate_link_src_cache[source]
         link_dst = self.candidate_link_dst_cache[source]
+        link_mask = self.candidate_link_mask_cache[source]
+        compute_mask = self.candidate_compute_mask_cache[source]
 
         observed_availability = self.observed_available[link_src, link_dst]
         observed_rates = self.observed_rates[link_src, link_dst]
         wireless_confidence = observed_availability[:, 0]
         wireless_quality = observed_rates[:, 0] * (0.35 + 0.65 * wireless_confidence)
-        wired_bottleneck = np.clip(np.percentile(observed_rates[:, 1:], 25, axis=1), 0.0, 1.0).astype(np.float32)
-        path_confidence = observed_availability.mean(axis=1).astype(np.float32)
+        wired_rates = np.where(link_mask[:, 1:] > 0.5, observed_rates[:, 1:], 1.0)
+        wired_bottleneck = np.clip(np.min(wired_rates, axis=1), 0.0, 1.0).astype(
+            np.float32
+        )
+        path_confidence = (
+            (observed_availability * link_mask).sum(axis=1)
+            / np.clip(link_mask.sum(axis=1), 1.0, None)
+        ).astype(np.float32)
         prev_observed_availability = self.prev_observed_available[link_src, link_dst]
         prev_observed_rates = self.prev_observed_rates[link_src, link_dst]
         prev_wireless_confidence = prev_observed_availability[:, 0]
         prev_wireless_quality = prev_observed_rates[:, 0] * (0.35 + 0.65 * prev_wireless_confidence)
-        prev_path_confidence = prev_observed_availability.mean(axis=1).astype(np.float32)
+        prev_path_confidence = (
+            (prev_observed_availability * link_mask).sum(axis=1)
+            / np.clip(link_mask.sum(axis=1), 1.0, None)
+        ).astype(np.float32)
 
         queue_pressures = self.observed_queue_pressure[compute_nodes]
         capacities = self.observed_capacity[compute_nodes]
         node_pressures = self.observed_node_pressure[compute_nodes]
         prev_queue_pressures = self.prev_observed_queue_pressure[compute_nodes]
-        edge_queue_mean = queue_pressures[:, :2].mean(axis=1)
-        cloud_queue = queue_pressures[:, 2]
-        edge_capacity_mean = capacities[:, :2].mean(axis=1)
-        cloud_capacity = capacities[:, 2]
-        path_pressure = node_pressures.mean(axis=1)
-        prev_edge_queue_mean = prev_queue_pressures[:, :2].mean(axis=1)
-        prev_cloud_queue = prev_queue_pressures[:, 2]
+        node_types = self.node_types[compute_nodes]
+        edge_mask = compute_mask * (node_types == 2).astype(np.float32)
+        cloud_mask = compute_mask * (node_types == 3).astype(np.float32)
+
+        def masked_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+            return (values * mask).sum(axis=1) / np.clip(mask.sum(axis=1), 1.0, None)
+
+        edge_queue_mean = masked_mean(queue_pressures, edge_mask)
+        cloud_queue = masked_mean(queue_pressures, cloud_mask)
+        edge_capacity_mean = masked_mean(capacities, edge_mask)
+        cloud_capacity = masked_mean(capacities, cloud_mask)
+        path_pressure = masked_mean(node_pressures, compute_mask)
+        prev_edge_queue_mean = masked_mean(prev_queue_pressures, edge_mask)
+        prev_cloud_queue = masked_mean(prev_queue_pressures, cloud_mask)
         propagation_delay_norm = self.candidate_propagation_norm_cache[source]
         static_prior = self.candidate_static_prior_cache[source]
         wireless_quality_trend = self._encode_trend(wireless_quality, prev_wireless_quality)
@@ -1461,11 +2216,23 @@ class SimplifiedRoutingEnv:
             ],
             axis=1,
         )
-        candidate_mask = np.clip(path_confidence, self.config.path_confidence_floor, 1.0).astype(np.float32)
+        candidate_mask = self._available_candidate_mask(source)
         return path_nodes, candidate_features, candidate_mask
 
     def _path_features(self, path: CandidatePath) -> np.ndarray:
-        static_prior = float(np.clip(self._path_static_cost(path.nodes, path.compute_nodes) / 1.4, 0.0, 1.0))
+        static_prior = float(
+            np.clip(
+                self._path_static_cost(
+                    path.nodes,
+                    path.compute_nodes,
+                    path.link_mask,
+                    path.compute_mask,
+                )
+                / 1.4,
+                0.0,
+                1.0,
+            )
+        )
         wireless_src, wireless_dst = path.nodes[0], path.nodes[1]
         wireless_confidence = float(self.observed_available[wireless_src, wireless_dst])
         wireless_quality = float(
@@ -1479,7 +2246,9 @@ class SimplifiedRoutingEnv:
         wired_strengths = []
         confidences = []
         prev_confidences = []
-        for src, dst in zip(path.nodes[:-1], path.nodes[1:]):
+        for src, dst, valid in zip(path.nodes[:-1], path.nodes[1:], path.link_mask):
+            if valid < 0.5:
+                continue
             confidences.append(float(self.observed_available[src, dst]))
             prev_confidences.append(float(self.prev_observed_available[src, dst]))
             if self.edge_kinds[src, dst] == 2:
@@ -1488,30 +2257,53 @@ class SimplifiedRoutingEnv:
         path_confidence = float(np.mean(confidences))
         prev_path_confidence = float(np.mean(prev_confidences)) if prev_confidences else path_confidence
 
+        valid_compute_nodes = [
+            node_id
+            for node_id, valid in zip(path.compute_nodes, path.compute_mask)
+            if valid >= 0.5
+        ]
         queue_pressures = np.asarray(
-            [self.observed_queue_pressure[node_id] for node_id in path.compute_nodes],
+            [self.observed_queue_pressure[node_id] for node_id in valid_compute_nodes],
             dtype=np.float32,
         )
         prev_queue_pressures = np.asarray(
-            [self.prev_observed_queue_pressure[node_id] for node_id in path.compute_nodes],
+            [self.prev_observed_queue_pressure[node_id] for node_id in valid_compute_nodes],
             dtype=np.float32,
         )
         capacities = np.asarray(
-            [self.observed_capacity[node_id] for node_id in path.compute_nodes],
+            [self.observed_capacity[node_id] for node_id in valid_compute_nodes],
             dtype=np.float32,
         )
         node_pressures = np.asarray(
-            [self.observed_node_pressure[node_id] for node_id in path.compute_nodes],
+            [self.observed_node_pressure[node_id] for node_id in valid_compute_nodes],
             dtype=np.float32,
         )
-        edge_queue_mean = float(np.mean(queue_pressures[:2]))
-        cloud_queue = float(queue_pressures[2])
-        edge_capacity_mean = float(np.mean(capacities[:2]))
-        cloud_capacity = float(capacities[2])
+        valid_node_types = np.asarray(
+            [self.node_types[node_id] for node_id in valid_compute_nodes],
+            dtype=np.int64,
+        )
+        edge_values = valid_node_types == 2
+        cloud_values = valid_node_types == 3
+        edge_queue_mean = float(np.mean(queue_pressures[edge_values]))
+        cloud_queue = (
+            float(np.mean(queue_pressures[cloud_values]))
+            if np.any(cloud_values)
+            else 0.0
+        )
+        edge_capacity_mean = float(np.mean(capacities[edge_values]))
+        cloud_capacity = (
+            float(np.mean(capacities[cloud_values]))
+            if np.any(cloud_values)
+            else 0.0
+        )
         propagation_delay_norm = float(np.clip(path.propagation_delay / 0.05, 0.0, 1.0))
         path_pressure = float(np.mean(node_pressures))
-        prev_edge_queue_mean = float(np.mean(prev_queue_pressures[:2]))
-        prev_cloud_queue = float(prev_queue_pressures[2])
+        prev_edge_queue_mean = float(np.mean(prev_queue_pressures[edge_values]))
+        prev_cloud_queue = (
+            float(np.mean(prev_queue_pressures[cloud_values]))
+            if np.any(cloud_values)
+            else 0.0
+        )
 
         return np.asarray(
             [
@@ -1534,7 +2326,15 @@ class SimplifiedRoutingEnv:
         )
 
     def _path_confidence(self, path: CandidatePath) -> float:
-        link_confidences = [float(self.observed_available[src, dst]) for src, dst in zip(path.nodes[:-1], path.nodes[1:])]
+        link_confidences = [
+            float(self.observed_available[src, dst])
+            for src, dst, valid in zip(
+                path.nodes[:-1],
+                path.nodes[1:],
+                path.link_mask,
+            )
+            if valid >= 0.5
+        ]
         if not link_confidences:
             return 1.0
         path_confidence = float(np.mean(link_confidences))

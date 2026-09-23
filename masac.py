@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ from torch.nn import functional as F
 
 from config import ExperimentConfig
 from env import SimplifiedRoutingEnv
-from evaluation_tools import rollout_policy
+from evaluation_tools import rollout_policy, task_observation_from_slot
 from utils import save_history_csv, save_metrics_json, set_seed
 
 MASAC_CANDIDATE_FEATURE_INDICES = (1, 2, 4, 5, 8)
@@ -38,6 +38,7 @@ class MASACConfig:
     route_alpha: float = 0.08
     alloc_alpha: float = 0.02
     updates_per_env_step: int = 1
+    update_interval_slots: int = 1
     log_std_min: float = -4.5
     log_std_max: float = 1.0
     gumbel_tau: float = 0.8
@@ -45,6 +46,14 @@ class MASACConfig:
     device: str = "cpu"
     checkpoint_name: str = "masac_actor.pt"
     best_checkpoint_name: str = "best_masac_actor.pt"
+
+    def __post_init__(self) -> None:
+        if self.update_interval_slots < 1:
+            raise ValueError("update_interval_slots must be at least 1")
+
+
+def apply_masac_variant(config: ExperimentConfig) -> ExperimentConfig:
+    return replace(config, method_name="MA-SAC")
 
 
 def zero_observation_like(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -58,6 +67,9 @@ def obs_to_torch(obs: dict[str, np.ndarray], device: str) -> dict[str, Tensor]:
             obs["candidate_features"], dtype=torch.float32, device=device
         ).unsqueeze(0),
         "candidate_mask": torch.as_tensor(obs["candidate_mask"], dtype=torch.float32, device=device).unsqueeze(0),
+        "candidate_alloc_mask": torch.as_tensor(
+            obs["candidate_alloc_mask"], dtype=torch.float32, device=device
+        ).unsqueeze(0),
     }
 
 
@@ -66,6 +78,9 @@ def batch_obs_to_torch(batch: dict[str, np.ndarray], device: str) -> dict[str, T
         "task_features": torch.as_tensor(batch["task_features"], dtype=torch.float32, device=device),
         "candidate_features": torch.as_tensor(batch["candidate_features"], dtype=torch.float32, device=device),
         "candidate_mask": torch.as_tensor(batch["candidate_mask"], dtype=torch.float32, device=device),
+        "candidate_alloc_mask": torch.as_tensor(
+            batch["candidate_alloc_mask"], dtype=torch.float32, device=device
+        ),
     }
 
 
@@ -87,20 +102,47 @@ def gather_candidate_features(candidate_features: Tensor, route_onehot: Tensor) 
     return torch.einsum("br,brf->bf", route_onehot, candidate_subset)
 
 
-def edge_preferred_allocation(alloc_latent: Tensor, selected_candidate: Tensor) -> Tensor:
-    edge_logits = alloc_latent[:, :2]
-    cloud_logit = alloc_latent[:, 2:3]
+def edge_preferred_allocation(
+    alloc_latent: Tensor,
+    selected_candidate: Tensor,
+    allocation_mask: Tensor | None = None,
+) -> Tensor:
+    if alloc_latent.size(-1) != 3:
+        raise ValueError("Edge-preferred allocation expects two edge nodes and one cloud node.")
+    if allocation_mask is None:
+        allocation_mask = torch.ones_like(alloc_latent)
 
-    edge_alloc = F.softmax(edge_logits, dim=-1)
-    edge_queue = selected_candidate[:, MASAC_EDGE_QUEUE_OFFSET : MASAC_EDGE_QUEUE_OFFSET + 1]
-    cloud_queue = selected_candidate[:, MASAC_CLOUD_QUEUE_OFFSET : MASAC_CLOUD_QUEUE_OFFSET + 1]
+    edge_logits = alloc_latent[..., :2]
+    cloud_logit = alloc_latent[..., 2:3]
+    edge_mask = allocation_mask[..., :2]
+    cloud_mask = allocation_mask[..., 2:3]
+
+    masked_edge_logits = edge_logits.masked_fill(edge_mask < 0.5, -1.0e9)
+    edge_alloc = F.softmax(masked_edge_logits, dim=-1) * edge_mask
+    edge_available = edge_mask.sum(dim=-1, keepdim=True) > 0.5
+    edge_alloc = edge_alloc / edge_alloc.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+    edge_queue = selected_candidate[
+        ..., MASAC_EDGE_QUEUE_OFFSET : MASAC_EDGE_QUEUE_OFFSET + 1
+    ]
+    cloud_queue = selected_candidate[
+        ..., MASAC_CLOUD_QUEUE_OFFSET : MASAC_CLOUD_QUEUE_OFFSET + 1
+    ]
 
     # Keep cloud as a congestion-relief option rather than the default sink.
     adaptive_cloud_cap = torch.clamp(0.12 + 0.38 * edge_queue, min=0.10, max=0.55)
     cloud_gate = adaptive_cloud_cap * torch.sigmoid(cloud_logit - 1.35 - 0.65 * cloud_queue)
+    cloud_gate = cloud_gate * cloud_mask
+    cloud_gate = torch.where(edge_available, cloud_gate, cloud_mask)
     edge_scale = (1.0 - cloud_gate).clamp_min(1e-6)
     allocation = torch.cat([edge_scale * edge_alloc, cloud_gate], dim=-1)
+    allocation = allocation * allocation_mask
     return allocation / allocation.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def masked_simplex(logits: Tensor, mask: Tensor) -> Tensor:
+    """Map logits to a simplex while assigning exactly zero mass to padded nodes."""
+    masked_logits = logits.masked_fill(mask < 0.5, -1.0e9)
+    return F.softmax(masked_logits, dim=-1)
 
 
 class ReplayBuffer:
@@ -111,12 +153,14 @@ class ReplayBuffer:
         self.task_features: np.ndarray | None = None
         self.candidate_features: np.ndarray | None = None
         self.candidate_mask: np.ndarray | None = None
+        self.candidate_alloc_mask: np.ndarray | None = None
         self.route_idx: np.ndarray | None = None
         self.allocation: np.ndarray | None = None
         self.reward: np.ndarray | None = None
         self.next_task_features: np.ndarray | None = None
         self.next_candidate_features: np.ndarray | None = None
         self.next_candidate_mask: np.ndarray | None = None
+        self.next_candidate_alloc_mask: np.ndarray | None = None
         self.done: np.ndarray | None = None
 
     def _ensure_arrays(self, obs: dict[str, np.ndarray], allocation_dim: int) -> None:
@@ -125,6 +169,9 @@ class ReplayBuffer:
         self.task_features = np.zeros((self.capacity, *obs["task_features"].shape), dtype=np.float32)
         self.candidate_features = np.zeros((self.capacity, *obs["candidate_features"].shape), dtype=np.float32)
         self.candidate_mask = np.zeros((self.capacity, *obs["candidate_mask"].shape), dtype=np.float32)
+        self.candidate_alloc_mask = np.zeros(
+            (self.capacity, *obs["candidate_alloc_mask"].shape), dtype=np.float32
+        )
         self.route_idx = np.zeros((self.capacity,), dtype=np.int64)
         self.allocation = np.zeros((self.capacity, allocation_dim), dtype=np.float32)
         self.reward = np.zeros((self.capacity,), dtype=np.float32)
@@ -133,6 +180,9 @@ class ReplayBuffer:
             (self.capacity, *obs["candidate_features"].shape), dtype=np.float32
         )
         self.next_candidate_mask = np.zeros((self.capacity, *obs["candidate_mask"].shape), dtype=np.float32)
+        self.next_candidate_alloc_mask = np.zeros(
+            (self.capacity, *obs["candidate_alloc_mask"].shape), dtype=np.float32
+        )
         self.done = np.zeros((self.capacity,), dtype=np.float32)
 
     def add(
@@ -148,24 +198,28 @@ class ReplayBuffer:
         assert self.task_features is not None
         assert self.candidate_features is not None
         assert self.candidate_mask is not None
+        assert self.candidate_alloc_mask is not None
         assert self.route_idx is not None
         assert self.allocation is not None
         assert self.reward is not None
         assert self.next_task_features is not None
         assert self.next_candidate_features is not None
         assert self.next_candidate_mask is not None
+        assert self.next_candidate_alloc_mask is not None
         assert self.done is not None
 
         idx = self.position
         self.task_features[idx] = obs["task_features"]
         self.candidate_features[idx] = obs["candidate_features"]
         self.candidate_mask[idx] = obs["candidate_mask"]
+        self.candidate_alloc_mask[idx] = obs["candidate_alloc_mask"]
         self.route_idx[idx] = int(route_idx)
         self.allocation[idx] = allocation.astype(np.float32)
         self.reward[idx] = float(reward)
         self.next_task_features[idx] = next_obs["task_features"]
         self.next_candidate_features[idx] = next_obs["candidate_features"]
         self.next_candidate_mask[idx] = next_obs["candidate_mask"]
+        self.next_candidate_alloc_mask[idx] = next_obs["candidate_alloc_mask"]
         self.done[idx] = float(done)
 
         self.position = (self.position + 1) % self.capacity
@@ -177,12 +231,14 @@ class ReplayBuffer:
         assert self.task_features is not None
         assert self.candidate_features is not None
         assert self.candidate_mask is not None
+        assert self.candidate_alloc_mask is not None
         assert self.route_idx is not None
         assert self.allocation is not None
         assert self.reward is not None
         assert self.next_task_features is not None
         assert self.next_candidate_features is not None
         assert self.next_candidate_mask is not None
+        assert self.next_candidate_alloc_mask is not None
         assert self.done is not None
 
         indices = np.random.randint(0, self.size, size=batch_size)
@@ -191,6 +247,7 @@ class ReplayBuffer:
                 "task_features": self.task_features[indices],
                 "candidate_features": self.candidate_features[indices],
                 "candidate_mask": self.candidate_mask[indices],
+                "candidate_alloc_mask": self.candidate_alloc_mask[indices],
             },
             device,
         )
@@ -199,6 +256,7 @@ class ReplayBuffer:
                 "task_features": self.next_task_features[indices],
                 "candidate_features": self.next_candidate_features[indices],
                 "candidate_mask": self.next_candidate_mask[indices],
+                "candidate_alloc_mask": self.next_candidate_alloc_mask[indices],
             },
             device,
         )
@@ -275,6 +333,9 @@ class MASACActor(nn.Module):
         route_log_prob = torch.sum(route_onehot * log_route_probs, dim=-1)
 
         selected_candidate = gather_candidate_features(obs["candidate_features"], route_onehot)
+        selected_alloc_mask = torch.einsum(
+            "br,bra->ba", route_onehot, obs["candidate_alloc_mask"]
+        )
         alloc_stats = self.alloc_head(torch.cat([task_context, selected_candidate], dim=-1))
         alloc_mean, alloc_log_std = torch.chunk(alloc_stats, 2, dim=-1)
         alloc_log_std = alloc_log_std.clamp(log_std_min, log_std_max)
@@ -286,15 +347,20 @@ class MASACActor(nn.Module):
             alloc_std = alloc_log_std.exp()
             alloc_noise = torch.randn_like(alloc_std)
             alloc_latent = alloc_mean + alloc_std * alloc_noise
-            alloc_log_prob = (
+            alloc_log_prob_per_dim = (
                 -0.5
                 * (
                     ((alloc_latent - alloc_mean) / alloc_std.clamp_min(1e-6)) ** 2
                     + 2.0 * alloc_log_std
                     + math.log(2.0 * math.pi)
                 )
-            ).sum(dim=-1)
-        allocation = edge_preferred_allocation(alloc_latent, selected_candidate)
+            )
+            alloc_log_prob = (alloc_log_prob_per_dim * selected_alloc_mask).sum(dim=-1)
+        allocation = edge_preferred_allocation(
+            alloc_latent,
+            selected_candidate,
+            selected_alloc_mask,
+        )
 
         return {
             "route_idx": route_idx,
@@ -365,7 +431,7 @@ class MASACPolicyAdapter:
 
 class MASACTrainer:
     def __init__(self, env_config: ExperimentConfig, train_config: MASACConfig, output_dir: Path):
-        self.env_config = env_config
+        self.env_config = apply_masac_variant(env_config)
         self.train_config = train_config
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -406,6 +472,7 @@ class MASACTrainer:
 
         self.buffer = ReplayBuffer(train_config.replay_size)
         self.total_steps = 0
+        self.decision_slots = 0
         self.training_history: list[dict[str, float]] = []
         self.episode_history: list[dict[str, float]] = []
         self.best_eval_score = -float("inf")
@@ -425,11 +492,80 @@ class MASACTrainer:
         rng = np.random.default_rng(self.env_config.seed + 1234)
 
         for episode_idx in range(self.train_config.train_episodes):
-            obs = self.env.reset(seed=self.env_config.seed + episode_idx)
+            obs = (
+                self.env.reset_slot(seed=self.env_config.seed + episode_idx)
+                if self.env_config.use_multi_task_slots
+                else self.env.reset(seed=self.env_config.seed + episode_idx)
+            )
             episode_rewards: list[float] = []
             episode_metrics: list[dict[str, float]] = []
 
             for _ in range(self.env_config.episode_length):
+                if self.env_config.use_multi_task_slots:
+                    task_observations = [
+                        task_observation_from_slot(obs, task_idx)
+                        for task_idx in range(int(obs["task_features"].shape[0]))
+                    ]
+                    routes: list[int] = []
+                    allocations: list[np.ndarray] = []
+                    for task_obs in task_observations:
+                        if self.total_steps < self.train_config.warmup_steps:
+                            route_probs = np.clip(
+                                task_obs["candidate_mask"].astype(np.float64), 1e-6, None
+                            )
+                            route_probs /= route_probs.sum()
+                            route_idx = int(rng.choice(self.num_routes, p=route_probs))
+                            valid_alloc = task_obs["candidate_alloc_mask"][route_idx]
+                            allocation = rng.random(self.alloc_dim, dtype=np.float32) * valid_alloc
+                            allocation /= np.clip(allocation.sum(), 1e-6, None)
+                        else:
+                            route_idx, allocation = self.policy_adapter().act_numpy(
+                                task_obs, deterministic=False
+                            )
+                        routes.append(route_idx)
+                        allocations.append(allocation)
+
+                    next_obs, reward, done, info = self.env.step_slot(
+                        {
+                            "route_idx": np.asarray(routes, dtype=np.int64),
+                            "allocation": np.stack(allocations),
+                        }
+                    )
+                    task_infos = info["task_infos"]
+                    for task_idx, (task_obs, task_info) in enumerate(
+                        zip(task_observations, task_infos)
+                    ):
+                        stored_next_obs = (
+                            zero_observation_like(task_obs)
+                            if done or next_obs is None
+                            else task_observation_from_slot(
+                                next_obs, task_idx % int(next_obs["task_features"].shape[0])
+                            )
+                        )
+                        self.buffer.add(
+                            task_obs,
+                            int(task_info["route_idx"]),
+                            np.asarray(task_info["allocation"], dtype=np.float32),
+                            float(task_info["reward"]),
+                            stored_next_obs,
+                            done,
+                        )
+                    episode_rewards.append(float(reward))
+                    episode_metrics.append(info)
+                    self.total_steps += len(task_observations)
+                    self.decision_slots += 1
+                    if (
+                        len(self.buffer) >= self.train_config.batch_size
+                        and self.total_steps >= self.train_config.warmup_steps
+                        and self.decision_slots % self.train_config.update_interval_slots == 0
+                    ):
+                        for _ in range(self.train_config.updates_per_env_step):
+                            recent_losses.append(self.update_step())
+                    obs = next_obs if next_obs is not None else obs
+                    if done:
+                        break
+                    continue
+
                 if self.total_steps < self.train_config.warmup_steps:
                     route_probs = np.clip(obs["candidate_mask"].astype(np.float64), 1e-6, None)
                     route_probs = route_probs / route_probs.sum()
@@ -447,8 +583,13 @@ class MASACTrainer:
                 episode_metrics.append(info)
                 obs = next_obs if next_obs is not None else zero_observation_like(obs)
                 self.total_steps += 1
+                self.decision_slots += 1
 
-                if len(self.buffer) >= self.train_config.batch_size and self.total_steps >= self.train_config.warmup_steps:
+                if (
+                    len(self.buffer) >= self.train_config.batch_size
+                    and self.total_steps >= self.train_config.warmup_steps
+                    and self.decision_slots % self.train_config.update_interval_slots == 0
+                ):
                     for _ in range(self.train_config.updates_per_env_step):
                         recent_losses.append(self.update_step())
 
@@ -481,6 +622,7 @@ class MASACTrainer:
                 train_row["eval_resource_utilization"] = float(eval_metrics["resource_utilization"])
                 train_row["buffer_size"] = float(len(self.buffer))
                 train_row["total_steps"] = float(self.total_steps)
+                train_row["decision_slots"] = float(self.decision_slots)
                 self.training_history.append(train_row)
                 recent_losses = []
 

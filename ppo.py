@@ -3,7 +3,7 @@ from __future__ import annotations
 import atexit
 import copy
 import multiprocessing as mp
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List
 
 import numpy as np
@@ -20,8 +20,17 @@ from model import HybridRoutingPolicy
 from baselines import heuristic_action
 
 
-OBS_FLOAT_KEYS = ("node_features", "adjacency", "task_features", "candidate_features", "candidate_mask")
-OBS_LONG_KEYS = ("candidate_nodes",)
+OBS_FLOAT_KEYS = (
+    "node_features",
+    "adjacency",
+    "task_features",
+    "candidate_features",
+    "candidate_mask",
+    "candidate_node_mask",
+    "candidate_link_mask",
+    "candidate_alloc_mask",
+)
+OBS_LONG_KEYS = ("candidate_nodes", "candidate_compute_nodes", "source_node")
 
 
 @dataclass
@@ -100,19 +109,20 @@ class PPOTrainer:
         self.config = config
         self.env = env
         self.rollout_envs = [
-            SimplifiedRoutingEnv(config) for _ in range(max(int(config.rollout_episodes_per_update), 1))
+            SimplifiedRoutingEnv(self._topology_config(index, evaluation=False))
+            for index in range(max(int(config.rollout_episodes_per_update), 1))
         ]
         self.eval_envs = [
-            SimplifiedRoutingEnv(config)
-            for _ in range(max(int(config.train_eval_episodes), int(config.eval_episodes), 1))
+            SimplifiedRoutingEnv(self._topology_config(index, evaluation=True))
+            for index in range(max(int(config.train_eval_episodes), int(config.eval_episodes), 1))
         ]
         self.rollout_env_pool = None
         self.eval_env_pool = None
-        if config.parallel_rollout_envs > 1:
+        if not config.use_multi_task_slots and config.parallel_rollout_envs > 1:
             self.rollout_env_pool = _ParallelEnvPool(
                 config, min(int(config.parallel_rollout_envs), int(config.rollout_episodes_per_update))
             )
-        if config.parallel_eval_envs > 1:
+        if not config.use_multi_task_slots and config.parallel_eval_envs > 1:
             self.eval_env_pool = _ParallelEnvPool(
                 config, min(int(config.parallel_eval_envs), max(int(config.train_eval_episodes), int(config.eval_episodes)))
             )
@@ -164,6 +174,14 @@ class PPOTrainer:
         self.model.set_topology_prior_scale(self.current_topology_prior_scale)
         self._closed = False
         atexit.register(self.close)
+
+    def _topology_config(self, index: int, evaluation: bool) -> ExperimentConfig:
+        stride = max(int(self.config.topology_seed_stride), 0)
+        if stride == 0:
+            return self.config
+        held_out_offset = int(self.config.eval_topology_seed_offset) if evaluation else 0
+        topology_seed = int(self.config.seed) + held_out_offset + (index + 1) * stride
+        return replace(self.config, seed=topology_seed)
 
     def warmup(self) -> List[Dict[str, float]]:
         history: List[Dict[str, float]] = []
@@ -326,6 +344,9 @@ class PPOTrainer:
         return self._stack_observations(obs_list)
 
     def collect_rollout(self, update_idx: int) -> tuple[RolloutBatch, Dict[str, float], List[Dict[str, float]]]:
+        if self.config.use_multi_task_slots:
+            return self._collect_multi_task_rollout(update_idx)
+
         observation_store = {key: [] for key in OBS_FLOAT_KEYS + OBS_LONG_KEYS}
         route_actions = []
         allocations = []
@@ -490,6 +511,216 @@ class PPOTrainer:
 
         rollout_metrics = self._summarize_metrics(metrics, rewards)
         return batch, rollout_metrics, episode_summaries
+
+    def _collect_multi_task_rollout(
+        self,
+        update_idx: int,
+    ) -> tuple[RolloutBatch, Dict[str, float], List[Dict[str, float]]]:
+        observation_store = {key: [] for key in OBS_FLOAT_KEYS + OBS_LONG_KEYS}
+        route_actions: list[int] = []
+        allocations: list[np.ndarray] = []
+        old_route_log_probs: list[float] = []
+        old_values: list[float] = []
+        returns: list[float] = []
+        advantages: list[float] = []
+        slot_metrics: List[Dict[str, float]] = []
+        slot_rewards: list[float] = []
+        episode_summaries: List[Dict[str, float]] = []
+
+        num_envs = max(int(self.config.rollout_episodes_per_update), 1)
+        rollout_seeds = self._select_rollout_seeds(update_idx, num_envs)
+        active_envs = self.rollout_envs[:num_envs]
+        observations = [
+            env.reset_slot(seed=seed)
+            for env, seed in zip(active_envs, rollout_seeds)
+        ]
+        episode_step_metrics: List[List[Dict[str, float]]] = [
+            [] for _ in range(num_envs)
+        ]
+        episode_step_rewards: List[List[float]] = [
+            [] for _ in range(num_envs)
+        ]
+        episode_counter = len(self.episode_history)
+
+        for _ in range(self.config.episode_length):
+            task_counts = [int(obs["task_features"].shape[0]) for obs in observations]
+            obs_batch = self._concatenate_slot_observations(observations)
+            with torch.inference_mode():
+                if self.freeze_updates:
+                    action = self.model.act_deterministic(obs_batch)
+                else:
+                    action = self.model.act(
+                        obs_batch,
+                        deterministic_allocation=self.config.rollout_deterministic_allocation,
+                        deterministic_route=False,
+                    )
+
+            route_batch = action["route"].detach().cpu().numpy()
+            allocation_batch = action["allocation"].detach().cpu().numpy()
+            log_prob_batch = action["route_log_prob"].detach().cpu().numpy()
+            value_batch = action["value"].detach().cpu().numpy()
+
+            step_results = []
+            offset = 0
+            for env, count in zip(active_envs, task_counts):
+                next_offset = offset + count
+                step_results.append(
+                    env.step_slot(
+                        {
+                            "route_idx": route_batch[offset:next_offset],
+                            "allocation": allocation_batch[offset:next_offset],
+                        }
+                    )
+                )
+                offset = next_offset
+
+            next_observations = [
+                result[0] for result in step_results if result[0] is not None
+            ]
+            next_value_means = np.zeros(num_envs, dtype=np.float32)
+            if next_observations:
+                next_counts = [
+                    int(obs["task_features"].shape[0])
+                    for obs in next_observations
+                ]
+                next_batch = self._concatenate_slot_observations(next_observations)
+                with torch.inference_mode():
+                    next_values = self.model.value(next_batch).detach().cpu().numpy()
+                offset = 0
+                for env_idx, count in enumerate(next_counts):
+                    next_value_means[env_idx] = float(
+                        np.mean(next_values[offset : offset + count])
+                    )
+                    offset += count
+
+            offset = 0
+            for env_idx, (next_obs, slot_reward, done, info) in enumerate(step_results):
+                count = task_counts[env_idx]
+                next_offset = offset + count
+                current_obs = observations[env_idx]
+                for key in OBS_FLOAT_KEYS + OBS_LONG_KEYS:
+                    observation_store[key].extend(
+                        np.asarray(current_obs[key]).copy()
+                    )
+
+                task_rewards = np.asarray(
+                    [
+                        float(task_info["reward"])
+                        for task_info in info["task_infos"]
+                    ],
+                    dtype=np.float32,
+                )
+                bootstrap = 0.0 if done else self.config.gamma * next_value_means[env_idx]
+                task_returns = task_rewards + bootstrap
+                task_values = value_batch[offset:next_offset]
+
+                route_actions.extend(route_batch[offset:next_offset].astype(np.int64).tolist())
+                allocations.extend(allocation_batch[offset:next_offset].astype(np.float32))
+                old_route_log_probs.extend(
+                    log_prob_batch[offset:next_offset].astype(np.float32).tolist()
+                )
+                old_values.extend(task_values.astype(np.float32).tolist())
+                returns.extend(task_returns.astype(np.float32).tolist())
+                advantages.extend((task_returns - task_values).astype(np.float32).tolist())
+
+                numeric_info = {
+                    key: float(value)
+                    for key, value in info.items()
+                    if isinstance(value, (int, float, np.integer, np.floating))
+                }
+                slot_metrics.append(numeric_info)
+                slot_rewards.append(float(slot_reward))
+                episode_step_metrics[env_idx].append(numeric_info)
+                episode_step_rewards[env_idx].append(float(slot_reward))
+                offset = next_offset
+
+            observations = [
+                result[0] for result in step_results if result[0] is not None
+            ]
+            if not observations:
+                break
+
+        for episode_idx in range(num_envs):
+            episode_summaries.append(
+                self._build_episode_summary(
+                    update_idx=update_idx,
+                    episode_in_group=episode_idx,
+                    episode_index=episode_counter + episode_idx,
+                    episode_seed=rollout_seeds[episode_idx],
+                    step_metrics=episode_step_metrics[episode_idx],
+                    step_rewards=episode_step_rewards[episode_idx],
+                )
+            )
+
+        obs_tensors = {
+            key: torch.as_tensor(
+                np.asarray(values),
+                dtype=torch.float32,
+                device=self.config.device,
+            )
+            for key, values in observation_store.items()
+            if key in OBS_FLOAT_KEYS
+        }
+        obs_tensors.update(
+            {
+                key: torch.as_tensor(
+                    np.asarray(values),
+                    dtype=torch.long,
+                    device=self.config.device,
+                )
+                for key, values in observation_store.items()
+                if key in OBS_LONG_KEYS
+            }
+        )
+        batch = RolloutBatch(
+            observations=obs_tensors,
+            route_actions=torch.as_tensor(
+                route_actions, dtype=torch.long, device=self.config.device
+            ),
+            allocations=torch.as_tensor(
+                np.asarray(allocations),
+                dtype=torch.float32,
+                device=self.config.device,
+            ),
+            old_route_log_probs=torch.as_tensor(
+                old_route_log_probs,
+                dtype=torch.float32,
+                device=self.config.device,
+            ),
+            old_values=torch.as_tensor(
+                old_values, dtype=torch.float32, device=self.config.device
+            ),
+            returns=torch.as_tensor(
+                returns, dtype=torch.float32, device=self.config.device
+            ),
+            advantages=torch.as_tensor(
+                advantages, dtype=torch.float32, device=self.config.device
+            ),
+        )
+        return (
+            batch,
+            self._summarize_metrics(slot_metrics, slot_rewards),
+            episode_summaries,
+        )
+
+    def _concatenate_slot_observations(
+        self,
+        observations: List[Dict[str, np.ndarray]],
+    ) -> Dict[str, Tensor]:
+        batch: Dict[str, Tensor] = {}
+        for key in OBS_FLOAT_KEYS:
+            batch[key] = torch.as_tensor(
+                np.concatenate([obs[key] for obs in observations], axis=0),
+                dtype=torch.float32,
+                device=self.config.device,
+            )
+        for key in OBS_LONG_KEYS:
+            batch[key] = torch.as_tensor(
+                np.concatenate([obs[key] for obs in observations], axis=0),
+                dtype=torch.long,
+                device=self.config.device,
+            )
+        return batch
 
     def update_policy(self, batch: RolloutBatch) -> Dict[str, float]:
         num_samples = batch.route_actions.size(0)
@@ -723,10 +954,12 @@ class PPOTrainer:
         }
 
     def _set_training_schedule(self, update_idx: int) -> None:
-        if self.config.train_updates <= 1:
+        configured_updates = int(self.config.exploration_anneal_updates)
+        schedule_updates = configured_updates if configured_updates > 0 else int(self.config.train_updates)
+        if schedule_updates <= 1:
             progress = 1.0
         else:
-            progress = float(update_idx) / float(self.config.train_updates - 1)
+            progress = float(np.clip(update_idx / float(schedule_updates - 1), 0.0, 1.0))
 
         hold_fraction = min(max(self.config.exploration_hold_fraction, 0.0), 0.95)
         if progress <= hold_fraction:
@@ -736,9 +969,30 @@ class PPOTrainer:
         anneal_progress = float(np.clip(anneal_progress, 0.0, 1.0))
         anneal = anneal_progress ** max(self.config.exploration_decay_power, 1e-6)
 
-        self.current_lr = self.config.lr * (
-            (1.0 - anneal) + anneal * self.config.lr_final_factor
+        lr_configured_updates = int(self.config.learning_rate_anneal_updates)
+        lr_schedule_updates = lr_configured_updates if lr_configured_updates > 0 else schedule_updates
+        if lr_schedule_updates <= 1:
+            lr_progress = 1.0
+        else:
+            lr_progress = float(np.clip(update_idx / float(lr_schedule_updates - 1), 0.0, 1.0))
+        if lr_progress <= hold_fraction:
+            lr_anneal_progress = 0.0
+        else:
+            lr_anneal_progress = (lr_progress - hold_fraction) / max(1.0 - hold_fraction, 1e-6)
+        lr_anneal_progress = float(np.clip(lr_anneal_progress, 0.0, 1.0))
+        lr_anneal = lr_anneal_progress ** max(self.config.exploration_decay_power, 1e-6)
+
+        scheduled_lr = self.config.lr * (
+            (1.0 - lr_anneal) + lr_anneal * self.config.lr_final_factor
         )
+        warmup_updates = max(int(self.config.learning_rate_warmup_updates), 0)
+        if warmup_updates > 1 and update_idx < warmup_updates:
+            initial_factor = float(np.clip(self.config.learning_rate_warmup_initial_factor, 0.0, 1.0))
+            warmup_progress = float(update_idx) / float(warmup_updates - 1)
+            warmup_factor = initial_factor + (1.0 - initial_factor) * warmup_progress
+        else:
+            warmup_factor = 1.0
+        self.current_lr = scheduled_lr * warmup_factor
         for param_group, group_scale in zip(self.optimizer.param_groups, self.optimizer_group_scales):
             param_group["lr"] = self.current_lr * group_scale
 
@@ -882,6 +1136,13 @@ class PPOTrainer:
         record_episode_history: bool = False,
         update_idx: int | None = None,
     ) -> Dict[str, float] | tuple[Dict[str, float], List[Dict[str, float]]]:
+        if self.config.use_multi_task_slots:
+            return self._evaluate_multi_task(
+                episodes=episodes,
+                seed_base=seed_base,
+                record_episode_history=record_episode_history,
+                update_idx=update_idx,
+            )
         episode_metrics = []
         if seed_base is None:
             seed_base = self.config.final_eval_seed_base
@@ -956,6 +1217,84 @@ class PPOTrainer:
                         "episode_path_available_ratio": float(
                             np.mean([metric["path_available"] for metric in step_metrics])
                         ),
+                    }
+                )
+
+        summary = {
+            key: float(np.mean([metric[key] for metric in episode_metrics]))
+            for key in episode_metrics[0]
+        }
+        if record_episode_history:
+            return summary, eval_episode_metrics
+        return summary
+
+    def _evaluate_multi_task(
+        self,
+        episodes: int,
+        seed_base: int | None,
+        record_episode_history: bool,
+        update_idx: int | None,
+    ) -> Dict[str, float] | tuple[Dict[str, float], List[Dict[str, float]]]:
+        if seed_base is None:
+            seed_base = self.config.final_eval_seed_base
+        episode_metrics: List[Dict[str, float]] = []
+        eval_episode_metrics: List[Dict[str, float]] = []
+        eval_episode_offset = len(self.eval_episode_history)
+
+        for episode_idx in range(episodes):
+            env = self.eval_envs[episode_idx]
+            observation = env.reset_slot(seed=seed_base + episode_idx)
+            step_metrics: List[Dict[str, float]] = []
+            step_rewards: List[float] = []
+
+            while True:
+                obs_batch = self._concatenate_slot_observations([observation])
+                with torch.inference_mode():
+                    action = self.model.act_deterministic(obs_batch)
+                next_obs, reward, done, info = env.step_slot(
+                    {
+                        "route_idx": action["route"].detach().cpu().numpy(),
+                        "allocation": action["allocation"].detach().cpu().numpy(),
+                    }
+                )
+                numeric_info = {
+                    key: float(value)
+                    for key, value in info.items()
+                    if isinstance(value, (int, float, np.integer, np.floating))
+                }
+                step_metrics.append(numeric_info)
+                step_rewards.append(float(reward))
+                if done:
+                    break
+                observation = next_obs
+
+            avg_reward = float(np.mean(step_rewards))
+            avg_latency = float(np.mean([item["latency"] for item in step_metrics]))
+            hit_ratio = float(np.mean([item["deadline_hit"] for item in step_metrics]))
+            episode_metrics.append(
+                {
+                    "eval_reward": avg_reward,
+                    "eval_latency": avg_latency,
+                    "eval_deadline_hit_ratio": hit_ratio,
+                }
+            )
+            if record_episode_history:
+                eval_episode_metrics.append(
+                    {
+                        "update": float(update_idx if update_idx is not None else 0),
+                        "episode_in_eval": float(episode_idx + 1),
+                        "episode_index": float(eval_episode_offset + episode_idx + 1),
+                        "episode_reward": float(np.sum(step_rewards)),
+                        "episode_raw_reward": float(np.sum(step_rewards)),
+                        "episode_baseline_reward": float("nan"),
+                        "episode_reward_mean": avg_reward,
+                        "episode_length": float(len(step_rewards)),
+                        "episode_latency": avg_latency,
+                        "episode_deadline_hit_ratio": hit_ratio,
+                        "episode_violation_mean": float(
+                            np.mean([item["violation"] for item in step_metrics])
+                        ),
+                        "episode_path_available_ratio": 1.0,
                     }
                 )
 

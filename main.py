@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
+from pathlib import Path
+import sys
 
 import torch
 
@@ -9,11 +12,19 @@ from config import ExperimentConfig, apply_experiment_preset
 from env import SimplifiedRoutingEnv
 from model import HybridRoutingPolicy
 from ppo import PPOTrainer
+from experiment_protocol import write_run_manifest
 from utils import (
     save_history_csv,
     save_metrics_json,
     set_seed,
 )
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -24,9 +35,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--preset",
         type=str,
         default=None,
-        help="Experiment preset. Supported: default, toy, paper_lite, paper_curve, paper_curve_faithful, paper_curve_faithful_long4000.",
+        help="Experiment preset. Use v2 for the complete default setting.",
     )
     parser.add_argument("--updates", type=int, default=None, help="Number of PPO updates.")
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Initialize policy weights from an existing checkpoint.",
+    )
+    parser.add_argument(
+        "--route-head-refinement",
+        action="store_true",
+        help="Freeze encoders and allocation head while refining route/value heads.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("proposed", "graphpr"),
+        default="proposed",
+        help="Policy architecture variant.",
+    )
     parser.add_argument("--warmup-updates", type=int, default=None, help="Warm-up updates before PPO training.")
     parser.add_argument(
         "--search-bootstrap-updates",
@@ -41,6 +69,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Episodes collected per PPO update.",
     )
     parser.add_argument("--episode-length", type=int, default=None, help="Steps per rollout episode.")
+    parser.add_argument(
+        "--active-flows",
+        type=positive_int,
+        default=None,
+        help="Fix the number of active task flows in every slot.",
+    )
+    parser.add_argument(
+        "--active-flow-range",
+        nargs=2,
+        type=positive_int,
+        metavar=("MIN", "MAX"),
+        default=None,
+        help="Sample active task flows from a shared training range.",
+    )
     parser.add_argument("--eval-episodes", type=int, default=None, help="Evaluation episodes.")
     parser.add_argument(
         "--validation-episodes",
@@ -62,15 +104,66 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--eval-interval", type=int, default=None, help="Validation interval during training.")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate override.")
-    parser.add_argument("--ppo-epochs", type=int, default=None, help="PPO epochs override.")
-    parser.add_argument("--disable-gnn", action="store_true", help="Disable graph encoding for ablation.")
+    parser.add_argument("--shared-lr-factor", type=float, default=None, help="Shared encoder learning-rate multiplier.")
+    parser.add_argument("--actor-lr-factor", type=float, default=None, help="Actor learning-rate multiplier.")
+    parser.add_argument("--critic-lr-factor", type=float, default=None, help="Critic learning-rate multiplier.")
+    parser.add_argument("--hidden-dim", type=positive_int, default=None, help="Policy hidden dimension override.")
+    parser.add_argument("--graph-layers", type=positive_int, default=None, help="Number of graph layers override.")
     parser.add_argument(
-        "--disable-transformer",
-        action="store_true",
-        help="Disable Transformer context blocks for ablation.",
+        "--alloc-refinement-steps",
+        type=positive_int,
+        default=None,
+        help="Number of diffusion denoising steps for training and inference.",
     )
-    parser.add_argument("--disable-gdm", action="store_true", help="Disable diffusion allocation for ablation.")
+    parser.add_argument("--ppo-epochs", type=int, default=None, help="PPO epochs override.")
+    parser.add_argument("--clip-eps", type=float, default=None, help="PPO policy clipping threshold.")
+    parser.add_argument("--target-kl", type=float, default=None, help="PPO early-stop KL threshold.")
+    parser.add_argument(
+        "--disable-plateau-control",
+        action="store_true",
+        help="Disable validation-triggered rollback and parameter freezing.",
+    )
+    parser.add_argument(
+        "--local-graph-context",
+        action="store_true",
+        help="Use source/path graph embeddings without a pooled global graph summary.",
+    )
+    parser.add_argument(
+        "--graph-native-candidate-context",
+        action="store_true",
+        help="Infer compute-resource context from graph nodes instead of engineered path summaries.",
+    )
+    parser.add_argument(
+        "--stochastic-allocation-rollout",
+        dest="rollout_deterministic_allocation",
+        action="store_false",
+        default=None,
+        help="Sample GDM allocation actions during training while keeping evaluation deterministic.",
+    )
     parser.add_argument("--route-entropy", type=float, default=None, help="Route entropy coefficient override.")
+    parser.add_argument("--alloc-noise-scale", type=float, default=None, help="Initial allocation exploration-noise scale.")
+    parser.add_argument("--alloc-noise-final-scale", type=float, default=None, help="Final allocation exploration-noise scale.")
+    parser.add_argument("--adv-weight-eta", type=float, default=None, help="Advantage-weight temperature for allocation learning.")
+    parser.add_argument("--adv-weight-min", type=float, default=None, help="Minimum allocation advantage weight.")
+    parser.add_argument("--adv-weight-max", type=float, default=None, help="Maximum allocation advantage weight.")
+    parser.add_argument(
+        "--exploration-anneal-updates",
+        type=int,
+        default=None,
+        help="Complete exploration annealing after this many PPO updates.",
+    )
+    parser.add_argument(
+        "--learning-rate-anneal-updates",
+        type=int,
+        default=None,
+        help="Complete learning-rate annealing after this many PPO updates; zero follows exploration.",
+    )
+    parser.add_argument(
+        "--learning-rate-warmup-updates",
+        type=int,
+        default=None,
+        help="Linearly warm up the optimizer learning rate over the initial PPO updates.",
+    )
     parser.add_argument(
         "--warmup-route-coef",
         type=float,
@@ -114,6 +207,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Global scaling factor applied to sampled task deadlines.",
     )
     parser.add_argument(
+        "--topology-seed-stride",
+        type=int,
+        default=None,
+        help="Use fixed, distinct topology realizations across parallel train/eval environments.",
+    )
+    parser.add_argument(
         "--alloc-search-candidates",
         type=int,
         default=None,
@@ -130,6 +229,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Weight of the route-policy prior inside joint deterministic search.",
+    )
+    parser.add_argument(
+        "--gdm-only-search",
+        action="store_true",
+        help="Select only among policy routes and GDM-generated allocations.",
     )
     parser.add_argument(
         "--search-distill-route",
@@ -166,9 +270,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_policy_variant(config: ExperimentConfig, variant: str) -> ExperimentConfig:
+    if variant == "proposed":
+        return config
+    common = dict(
+        use_topology_route_prior=False,
+        use_topology_distillation=False,
+        use_search_distillation=False,
+        use_search_guided_inference=False,
+        topology_route_prior_initial_scale=0.0,
+        topology_route_prior_final_scale=0.0,
+        topology_distill_coef=0.0,
+        topology_distill_final_coef=0.0,
+        search_distill_route_coef=0.0,
+        search_distill_diffusion_coef=0.0,
+        allocation_search_candidates=1,
+        route_search_candidates=1,
+        route_search_prior_coef=0.0,
+    )
+    if variant == "graphpr":
+        return replace(
+            config,
+            method_name="GraphPR",
+            use_gnn_encoder=True,
+            use_graph_attention_encoder=True,
+            use_transformer_context=False,
+            use_gdm_allocator=False,
+            allocation_policy_family="direct",
+            **common,
+        )
+    raise ValueError(f"Unsupported policy variant: {variant}")
+
+
+def initialize_model_from_checkpoint(
+    model: HybridRoutingPolicy, checkpoint_path: str, device: str
+) -> None:
+    payload = torch.load(Path(checkpoint_path), map_location=device)
+    state_dict = payload.get("model_state_dict", payload) if isinstance(payload, dict) else payload
+    model.load_state_dict(state_dict)
+
+
+def configure_route_head_refinement(model: HybridRoutingPolicy) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for module in (model.route_head, model.value_head):
+        for parameter in module.parameters():
+            parameter.requires_grad_(True)
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    started_at = datetime.now(timezone.utc).isoformat()
 
     config = ExperimentConfig()
     if args.preset is not None:
@@ -183,6 +336,15 @@ def main() -> None:
         config = replace(config, rollout_episodes_per_update=args.rollout_episodes)
     if args.episode_length is not None:
         config = replace(config, episode_length=args.episode_length)
+    if args.active_flows is not None and args.active_flow_range is not None:
+        parser.error("--active-flows and --active-flow-range are mutually exclusive")
+    if args.active_flows is not None:
+        config = replace(config, active_flow_range=(args.active_flows, args.active_flows))
+    if args.active_flow_range is not None:
+        flow_min, flow_max = args.active_flow_range
+        if flow_min > flow_max:
+            parser.error("--active-flow-range requires MIN <= MAX")
+        config = replace(config, active_flow_range=(flow_min, flow_max))
     if args.eval_episodes is not None:
         config = replace(config, eval_episodes=args.eval_episodes)
     if args.validation_episodes is not None:
@@ -195,16 +357,73 @@ def main() -> None:
         config = replace(config, eval_interval=args.eval_interval)
     if args.lr is not None:
         config = replace(config, lr=args.lr)
+    if args.shared_lr_factor is not None:
+        config = replace(config, shared_lr_factor=args.shared_lr_factor)
+    if args.actor_lr_factor is not None:
+        config = replace(config, actor_lr_factor=args.actor_lr_factor)
+    if args.critic_lr_factor is not None:
+        config = replace(config, critic_lr_factor=args.critic_lr_factor)
+    if args.hidden_dim is not None:
+        config = replace(config, hidden_dim=args.hidden_dim)
+    if args.graph_layers is not None:
+        config = replace(config, graph_layers=args.graph_layers)
+    if args.alloc_refinement_steps is not None:
+        config = replace(config, alloc_refinement_steps=args.alloc_refinement_steps)
     if args.ppo_epochs is not None:
         config = replace(config, ppo_epochs=args.ppo_epochs)
-    if args.disable_gnn:
-        config = replace(config, use_gnn_encoder=False)
-    if args.disable_transformer:
-        config = replace(config, use_transformer_context=False)
-    if args.disable_gdm:
-        config = replace(config, use_gdm_allocator=False)
+    if args.clip_eps is not None:
+        config = replace(config, clip_eps=args.clip_eps)
+    if args.target_kl is not None:
+        config = replace(config, target_kl=args.target_kl)
+    if args.disable_plateau_control:
+        config = replace(
+            config,
+            plateau_patience_updates=0,
+            max_rollbacks=0,
+            freeze_after_rollbacks=False,
+        )
+    if args.local_graph_context:
+        config = replace(config, use_global_graph_context=False)
+    if args.graph_native_candidate_context:
+        config = replace(config, use_candidate_resource_summaries=False)
+    if args.rollout_deterministic_allocation is not None:
+        config = replace(
+            config,
+            rollout_deterministic_allocation=args.rollout_deterministic_allocation,
+        )
     if args.route_entropy is not None:
         config = replace(config, route_entropy_coef=args.route_entropy)
+    if args.alloc_noise_scale is not None:
+        config = replace(config, alloc_noise_scale=args.alloc_noise_scale)
+    if args.alloc_noise_final_scale is not None:
+        config = replace(config, alloc_noise_final_scale=args.alloc_noise_final_scale)
+    if args.adv_weight_eta is not None:
+        config = replace(config, adv_weight_eta=args.adv_weight_eta)
+    if args.adv_weight_min is not None:
+        config = replace(config, adv_weight_min=args.adv_weight_min)
+    if args.adv_weight_max is not None:
+        config = replace(config, adv_weight_max=args.adv_weight_max)
+    if args.exploration_anneal_updates is not None:
+        if args.exploration_anneal_updates < 0:
+            parser.error("--exploration-anneal-updates must be non-negative")
+        config = replace(
+            config,
+            exploration_anneal_updates=args.exploration_anneal_updates,
+        )
+    if args.learning_rate_anneal_updates is not None:
+        if args.learning_rate_anneal_updates < 0:
+            parser.error("--learning-rate-anneal-updates must be non-negative")
+        config = replace(
+            config,
+            learning_rate_anneal_updates=args.learning_rate_anneal_updates,
+        )
+    if args.learning_rate_warmup_updates is not None:
+        if args.learning_rate_warmup_updates < 0:
+            parser.error("--learning-rate-warmup-updates must be non-negative")
+        config = replace(
+            config,
+            learning_rate_warmup_updates=args.learning_rate_warmup_updates,
+        )
     if args.warmup_route_coef is not None:
         config = replace(config, warmup_route_coef=args.warmup_route_coef)
     if args.search_bootstrap_route_coef is not None:
@@ -219,12 +438,18 @@ def main() -> None:
         config = replace(config, topology_distill_final_coef=args.topology_distill_final)
     if args.deadline_budget_factor is not None:
         config = replace(config, deadline_budget_factor=args.deadline_budget_factor)
+    if args.topology_seed_stride is not None:
+        if args.topology_seed_stride < 0:
+            parser.error("--topology-seed-stride must be non-negative")
+        config = replace(config, topology_seed_stride=args.topology_seed_stride)
     if args.alloc_search_candidates is not None:
         config = replace(config, allocation_search_candidates=args.alloc_search_candidates)
     if args.route_search_candidates is not None:
         config = replace(config, route_search_candidates=args.route_search_candidates)
     if args.route_search_prior is not None:
         config = replace(config, route_search_prior_coef=args.route_search_prior)
+    if args.gdm_only_search:
+        config = replace(config, use_heuristic_search_candidates=False)
     if args.search_distill_route is not None:
         config = replace(config, search_distill_route_coef=args.search_distill_route)
     if args.search_distill_diffusion is not None:
@@ -239,6 +464,8 @@ def main() -> None:
         config = replace(config, seed=args.seed)
     if args.output_dir is not None:
         config = replace(config, output_dir=args.output_dir)
+
+    config = apply_policy_variant(config, args.variant)
 
     if args.device is None and config.device == "cpu" and torch.cuda.is_available():
         config = replace(config, device="cuda")
@@ -272,10 +499,19 @@ def main() -> None:
         surrogate_penalty_coef=config.penalty_coeff,
         use_topology_route_prior=config.use_topology_route_prior,
         use_search_guided_inference=config.use_search_guided_inference,
+        use_heuristic_search_candidates=config.use_heuristic_search_candidates,
         use_gnn_encoder=config.use_gnn_encoder,
+        use_graph_attention_encoder=config.use_graph_attention_encoder,
         use_transformer_context=config.use_transformer_context,
+        use_global_graph_context=config.use_global_graph_context,
+        use_candidate_resource_summaries=config.use_candidate_resource_summaries,
         use_gdm_allocator=config.use_gdm_allocator,
+        allocation_policy_family=config.allocation_policy_family,
     )
+    if args.init_checkpoint is not None:
+        initialize_model_from_checkpoint(model, args.init_checkpoint, config.device)
+    if args.route_head_refinement:
+        configure_route_head_refinement(model)
 
     trainer = PPOTrainer(config, env, model)
     try:
@@ -347,6 +583,23 @@ def main() -> None:
             **best_checkpoint_metrics,
         },
         config.output_path / "evaluation_metrics.json",
+    )
+    artifact_names = [
+        "routing_model.pt",
+        "routing_model_final.pt",
+        "training_history.csv",
+        "rollout_episode_history.csv",
+        "evaluation_metrics.json",
+    ]
+    if best_model_path.exists():
+        artifact_names.append("best_routing_model.pt")
+    write_run_manifest(
+        config.output_path,
+        config,
+        command=[sys.executable, *sys.argv],
+        started_at=started_at,
+        checkpoint="best_routing_model.pt" if best_model_path.exists() else "routing_model.pt",
+        artifacts=artifact_names,
     )
     final_row = history[-1] if history else {}
     best_eval_latency = float(best_checkpoint_metrics.get("best_eval_latency", float("nan")))
