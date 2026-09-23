@@ -128,3 +128,11 @@ The evaluation scripts report average end-to-end latency, deadline hit ratio, ti
 ## Reproducibility
 
 Experiment scripts expose deterministic seed controls and save a run manifest containing the command, configuration, software environment, Git commit, checkpoints, and generated artifacts.
+
+## Additional Information
+
+This version is more closely tied to the specific physical machine on which it runs (e.g., runtime testing), so we strongly recommend that users adjust the parameters and usage based on the specifics of their own runtime environment. For this reason, results may vary significantly when running on different devices.
+
+In addition, it’s very easy to design any interface for ablation experiments based on your specific needs. For example, if you refer to the ablation experiment code in our v1 version, you’ll see that all you need to do is create an interface for the relevant module you want to ablate. We’d just like to remind you to select the correct model version, but you can easily conduct any ablation experiment using the code from both versions.
+
+In summary, this version takes into account not only performance improvements but also the practicality, compatibility, and reproducibility of the algorithm in real-world deployments, representing a significant improvement over previous versions. We will continue to update it in the future.
